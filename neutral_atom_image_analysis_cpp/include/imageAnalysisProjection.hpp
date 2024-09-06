@@ -6,6 +6,8 @@
 #include <vector>
 #include <tuple>
 
+#include <fstream>
+
 #include "imageAnalysis.hpp"
 
 struct Image
@@ -31,7 +33,7 @@ protected:
 
     std::vector<Image> getLocalImages(
         const py::EigenDRef<const Eigen::Array<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>& fullImage);
-    std::vector<double> apply_projectors(std::vector<Image>& localImages);
+    std::vector<double> applyProjectors(std::vector<Image>& localImages);
 public:
     ImageAnalysisProjection(const pybind11::EigenDRef<const Eigen::Array<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>& psf, 
         std::vector<std::tuple<double, double>> atomLocations) : ImageAnalysis(psf, atomLocations)

@@ -3,7 +3,6 @@
 #include <pybind11/numpy.h>
 
 #include <optional>
-#include <fstream>
 #include <omp.h>
 
 void ImageAnalysisProjection::setProjGen(py::object& prjgen)
@@ -41,7 +40,7 @@ std::vector<double> ImageAnalysisProjection::reconstruct(
     py::EigenDRef<Eigen::Array<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> image)
 {
     auto localImages = this->getLocalImages(image);
-    auto localEmissions = this->apply_projectors(localImages);
+    auto localEmissions = this->applyProjectors(localImages);
     return localEmissions;
 }
 
@@ -62,7 +61,7 @@ std::vector<Image> ImageAnalysisProjection::getLocalImages(
         Image imageN
         {
             .image = fullImage.data(),
-            .offset = (size_t)(x_min * fullImage.cols() + y_min),
+            .offset = (size_t)(y_min * fullImage.cols() + x_min),
             .outerStride = (size_t)(fullImage.cols()),
             .innerStride = 1,
             .X_int = x_int,
@@ -71,15 +70,15 @@ std::vector<Image> ImageAnalysisProjection::getLocalImages(
             .X_max = x_max,
             .Y_min = y_min,
             .Y_max = y_max,
-            .dx = (int)(std::round((std::get<1>(coord) - x_int) * psfSupersample)),
-            .dy = (int)(std::round((std::get<0>(coord) - y_int) * psfSupersample))
+            .dx = (int)(std::round((std::get<1>(coord) - x_int) * this->psfSupersample)),
+            .dy = (int)(std::round((std::get<0>(coord) - y_int) * this->psfSupersample))
         };
         localImages.push_back(imageN);
     }
     return localImages;
 }
 
-std::vector<double> ImageAnalysisProjection::apply_projectors(std::vector<Image>& localImages)
+std::vector<double> ImageAnalysisProjection::applyProjectors(std::vector<Image>& localImages)
 {
     std::vector<double> emissions;
     emissions.resize(localImages.size());
@@ -88,18 +87,17 @@ std::vector<double> ImageAnalysisProjection::apply_projectors(std::vector<Image>
     for(size_t i = 0; i < localImages.size(); i++)
     {
         const Image& localImage = localImages[i];
-        int xidx = localImage.dx % psfSupersample;
-        int yidx = localImage.dy % psfSupersample;
-
-        const auto& imageProj = imageProjs[xidx * psfSupersample + yidx];
+        int xidx = (localImage.dx + this->psfSupersample) % this->psfSupersample;
+        int yidx = (localImage.dy + this->psfSupersample) % this->psfSupersample;
+        const auto& imageProj = imageProjs[yidx * this->psfSupersample + xidx];
 
         double sum = 0;
-        int cols = localImage.X_max - localImage.X_min + 1;
-        int pixelCount = cols * (localImage.Y_max - localImage.Y_min + 1);
+        int rows = localImage.Y_max - localImage.Y_min + 1;
+        int pixelCount = rows * (localImage.X_max - localImage.X_min + 1);
         for(int i = 0; i < pixelCount; i++)
         {
-            sum += localImage.image[localImage.offset + (i / cols) * 
-                localImage.outerStride + i % cols] * imageProj[i];
+            sum += localImage.image[localImage.offset + (i / rows) * 
+                localImage.outerStride + i % rows] * imageProj[i];
         }
         
         emissions[i] = sum;
