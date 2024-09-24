@@ -2,6 +2,7 @@
 
 #include <pybind11/numpy.h>
 
+#include <algorithm>
 #include <optional>
 #include <omp.h>
 
@@ -15,21 +16,21 @@ void ImageAnalysisProjection::setProjGen(py::object& prjgen)
     this->psfSupersample = prjgen.attr("psf_supersample").cast<int>();
     this->projShape = prjgen.attr("proj_shape").cast<Eigen::Array2i>();
 
-    py::array_t<double> projs = prjgen.attr("proj_cache").cast<py::array_t<double>>();
+    py::array_t<double, py::array::c_style | py::array::forcecast> projs = prjgen.attr("proj_cache").cast<py::array_t<double>>();
     const pybind11::ssize_t *shape = projs.shape();
     projs = projs.reshape(std::vector<int>({(int)(shape[0]), (int)(shape[1]), -1}));
     const pybind11::ssize_t *newShape = projs.shape();
 
-    for(int xidx = 0; xidx < this->psfSupersample; xidx++)
+    for(int yidx = 0; yidx < this->psfSupersample; yidx++)
     {
-        for(int yidx = 0; yidx < this->psfSupersample; yidx++)
+        for(int xidx = 0; xidx < this->psfSupersample; xidx++)
         {
             std::vector<double> imageProj;
 
             py::array proj = projs[py::make_tuple(xidx, yidx, py::ellipsis())];
             py::buffer_info info = proj.request();
             double *ptr = static_cast<double*>(info.ptr);
-            imageProj.insert(imageProj.end(), &ptr[0], &ptr[newShape[2] - 1]);
+            imageProj.insert(imageProj.end(), &ptr[0], &ptr[newShape[2]]);
 
             this->imageProjs.push_back(imageProj);
         }
@@ -94,12 +95,11 @@ std::vector<double> ImageAnalysisProjection::applyProjectors(std::vector<Image>&
         double sum = 0;
         int rows = localImage.Y_max - localImage.Y_min + 1;
         int pixelCount = rows * (localImage.X_max - localImage.X_min + 1);
-        for(int i = 0; i < pixelCount; i++)
+        for(int p = 0; p < pixelCount; p++)
         {
-            sum += localImage.image[localImage.offset + (i / rows) * 
-                localImage.outerStride + i % rows] * imageProj[i];
+            sum += localImage.image[localImage.offset + (p / rows) * 
+                localImage.outerStride + p % rows] * imageProj[p];
         }
-        
         emissions[i] = sum;
     }
     return emissions;

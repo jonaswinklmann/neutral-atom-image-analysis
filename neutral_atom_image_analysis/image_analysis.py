@@ -7,6 +7,8 @@ import os
 if sys.platform == "win32":
     os.add_dll_directory(os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(__file__) + "/")
+from datetime import datetime
+import math
 import neutral_atom_image_analysis_cpp
 import state_reconstruction
 import matplotlib.pyplot as plt
@@ -28,9 +30,9 @@ def three_gaussian_peaks(x, loc, scale, o_scale1, o_scale2, o_scale3, offset):
         norm.pdf(x, loc = loc * 2, scale = scale) * o_scale2 + \
         norm.pdf(x, loc = loc * 3, scale = scale) * o_scale3
 
-def two_gaussians(x, loc1, scale1, w1, loc2, scale2, w2):
-    return norm.pdf(x, loc = loc1, scale = scale1) * w1 + \
-        norm.pdf(x, loc = loc2, scale = scale2) * w2
+def two_gaussians(x, loc1, scale1, f, loc2, scale2):
+    return norm.pdf(x, loc = loc1, scale = scale1) * (1 - f) + \
+        norm.pdf(x, loc = loc2, scale = scale2) * f
 
 class ImageAnalysis(abc.ABC):
     def __init__(self):
@@ -46,9 +48,10 @@ class ImageAnalysis(abc.ABC):
     
 
 class ImageAnalysisProjection(ImageAnalysis):
-    def __init__(self, psf_supersample = 1):
+    def __init__(self, psf_supersample = 1, print_info = False):
         ImageAnalysis.__init__(self)
         self.psf_supersample = psf_supersample
+        self.print_info = print_info
 
     def _find_atom_locations(self, average_image, angle_guesses):
         target_axes = [90,0]
@@ -219,7 +222,7 @@ class ImageAnalysisProjection(ImageAnalysis):
         gaussian_peak_default = 0.3989422804
 
         popt, _ = curve_fit(two_gaussians, bin_centers, count, p0 = (bin_centers[first_peak_index], gaussian_peak_default / count[first_peak_index], 0.5, \
-            bin_centers[second_peak_index], gaussian_peak_default / count[second_peak_index], 0.5))
+            bin_centers[second_peak_index], gaussian_peak_default / count[second_peak_index]))
 
         # Take all sites where chance of being empty is below threshold
         threshold = norm.isf(0.001, popt[0], popt[1])
@@ -257,12 +260,13 @@ class ImageAnalysisProjection(ImageAnalysis):
                         x_max = image_np.shape[1]
                     image_detail = image_np[y_min:y_max,x_min:x_max]
                     image_detail = np.pad(image_detail, padding, mode='constant')
-                    image_detail = shift(image_detail, np.floor(atom_location) - np.array(atom_location), order=1)
-                    image_detail = zoom(image_detail[:-1,:-1], self.psf_supersample, order=1)
-                    self.psf += image_detail
+                    image_detail = shift(image_detail, (np.floor(atom_location) - np.array(atom_location)), order=1)
+                    image_detail = zoom(image_detail, self.psf_supersample, order=1)
+                    self.psf += image_detail[:-self.psf_supersample,:-self.psf_supersample]
         self.psf = self.psf / np.max(self.psf)
 
-    def calibrate(self, images, average_closed_shutter_image, angle_guesses : tuple[float,float] = (90,0), proj_shape : tuple[int,int] = (61, 61)):
+    def calibrate(self, images, average_closed_shutter_image = None, angle_guesses : tuple[float,float] = (90,0), proj_shape : tuple[int,int] = (61, 61), use_measured_loading_rate = True):
+        start_time = datetime.now()
         first = True
         for image in images:
             if isinstance(image, DataFrame):
@@ -275,17 +279,26 @@ class ImageAnalysisProjection(ImageAnalysis):
             else:
                 average_filled_image += image_np
 
+        if average_closed_shutter_image is None:
+            average_closed_shutter_image = np.full(image_np.shape, np.median(image_np))
+
         average_filled_image /= len(images)
 
         # Subtract closed-shutter image to reduce pixel and row noise and clamp image at 0
         average_filled_image -= average_closed_shutter_image
         average_filled_image[average_filled_image < 0] = 0
 
+        if self.print_info:
+            print("Acquring atom locations")
         self._find_atom_locations(average_filled_image, angle_guesses)
+        if self.print_info:
+            print("Acquring PSF")
         self._find_psf(images, average_closed_shutter_image)
 
-        plt.imshow(self.psf)
-        plt.show()
+        if self.print_info:
+            print("Full scale PSF: ")
+            plt.imshow(self.psf)
+            plt.show()
 
         trafo_site_to_image = AffineTrafo2d()
         # Set site unit vectors within image coordinate system
@@ -301,6 +314,16 @@ class ImageAnalysisProjection(ImageAnalysis):
             psf=self.psf, psf_supersample=self.psf_supersample
         )
 
+        if self.print_info and self.psf_supersample > 1:
+            print("Integrated subpixel PSFs:")
+            fig, ax = plt.subplots(self.psf_supersample, self.psf_supersample)
+            half_supersample = self.psf_supersample // 2
+            for i in range(self.psf_supersample):
+                for j in range(self.psf_supersample):
+                    ax[i,j].imshow(ipsf_gen.generate_integrated_psf(i - half_supersample, j - half_supersample))
+            fig.show()
+            plt.show()
+
         proj_gen = state_reconstruction.ProjectorGenerator(
             trafo_site_to_image=trafo_site_to_image,
             integrated_psf_generator=ipsf_gen,
@@ -310,14 +333,112 @@ class ImageAnalysisProjection(ImageAnalysis):
         # Pre-calculate projectors (this may take up to a few minutes)
         proj_gen.setup_cache(print_progress=True)
 
+        if self.print_info:
+            print("Integrated projector(s):")
+            if self.psf_supersample > 1:
+                fig, ax = plt.subplots(self.psf_supersample, self.psf_supersample)
+                
+                half_supersample = self.psf_supersample // 2
+                for i in range(self.psf_supersample):
+                    for j in range(self.psf_supersample):
+                        fig.colorbar(ax[i,j].imshow(proj_gen.proj_cache[i,j]), ax = ax[i,j])
+                fig.show()
+                plt.show()
+            else:
+                plt.imshow(proj_gen.proj_cache[0, 0])
+                plt.colorbar()
+                plt.show()
+
+        # Create object in underlying C++ library and set projectors
+        if self.print_info:
+            print("Creating C++ object")
         self.solver = neutral_atom_image_analysis_cpp.ImageAnalysisProjection(self.psf, self.atom_locations)
         self.solver.setProjGen(proj_gen)
 
+        parameters = []
+
+        # Reconstruct all test images to find best threshold
+        start_time_reconstruct = datetime.now()
+        for image in images:
+            if isinstance(image, DataFrame):
+                image_np = image.to_numpy(np.float64)
+            else:
+                image_np = np.array(image).astype(np.float64)
+            parameters.extend(self.reconstruct(image_np))
+        if self.print_info:
+            print("All images reconstructed within " + str((datetime.now() - start_time_reconstruct).total_seconds() * 1e3) + "ms")
+
+        # Find detection threshold
+        count, bin_edges = np.histogram(parameters, bins=int(np.sqrt(len(parameters))))
+        bin_size = bin_edges[1] - bin_edges[0]
+        count = np.array(count).astype(np.float64) / len(parameters) / bin_size
+        bin_centers = (np.array(bin_edges[:-1]) + np.array(bin_edges[1:])) / 2
+
+        # Find guesses for Gaussian fit
+        peaks, properties = find_peaks(count, prominence=0.00001)
+
+        peak_index_in_peaks = np.argmax(properties['prominences'])
+        first_peak_index = peaks[peak_index_in_peaks]
+        properties['prominences'][peak_index_in_peaks] = 0
+        peak_index_in_peaks = np.argmax(properties['prominences'])
+        second_peak_index = peaks[peak_index_in_peaks]
+
+        # Fit gaussian to acquire distributions
+        gaussian_peak_default = 0.3989422804
+        popt, _ = curve_fit(two_gaussians, bin_centers, count, p0 = (bin_centers[first_peak_index], gaussian_peak_default / count[first_peak_index], 0.5, \
+            bin_centers[second_peak_index], gaussian_peak_default / count[second_peak_index]))
+        
+        # Check that peaks are in correct order
+        if(popt[0] < popt[3]):
+            first_peak = popt[0]
+            sigma1 = popt[1]
+            filling_ratio = popt[2]
+            second_peak = popt[3]
+            sigma2 = popt[4]
+        else:
+            second_peak = popt[0]
+            sigma2 = popt[1]
+            filling_ratio = 1 - popt[2]
+            first_peak = popt[3]
+            sigma1 = popt[4]
+
+        # Use measured filling ratio or 0.5 if use_measured_loading_rate == False
+        if use_measured_loading_rate:
+            calibration_filling_ratio = filling_ratio
+        else:
+            calibration_filling_ratio = 0.5
+
+        # Calculate threshold so that weighted pdf is equal, i.e. minimize total error for given filling ratio
+        a = 1 / (2 * sigma2**2) - 1 / (2 * sigma1**2)
+        b = first_peak / (sigma1**2) - second_peak / (sigma2**2)
+        c = (second_peak**2) / (2 * sigma2**2) - (first_peak**2) / (2 * sigma1**2) + math.log(((1 - calibration_filling_ratio) * sigma2) / (calibration_filling_ratio * sigma1))
+        s = math.sqrt(b**2 - 4 * a * c)
+
+        threshold = (-b-s) / (2 * a)
+        if threshold < first_peak or threshold > second_peak:
+            threshold = (-b+s) / (2 * a)
+
+        fidelity0 = norm.cdf(threshold, loc = first_peak, scale = sigma1)
+        fidelity1 = norm.sf(threshold, loc = second_peak, scale = sigma2)
+        fidelity = (1 - calibration_filling_ratio) * fidelity0 + calibration_filling_ratio * fidelity1
+
+        if self.print_info:
+            print("Threshold: " + str(threshold))
+            print("F0: " + str(fidelity0))
+            print("F1: " + str(fidelity1))
+            print("F: " + str(fidelity))
+            print("Calibration finished, total time: " + str((datetime.now() - start_time).total_seconds() * 1e3) + "ms")
+
+        return threshold, [first_peak, second_peak], fidelity, fidelity0, fidelity1, calibration_filling_ratio, filling_ratio
+
     def reconstruct(self, image):
         # Preprocess image
-        image = np.array(image, dtype=float)
-        if np.isfortran(image):
-            image = np.ascontiguousarray(image)
+        if isinstance(image, DataFrame):
+            image_np = image.to_numpy(np.float64)
+        else:
+            image_np = np.array(image).astype(np.float64)
+        if np.isfortran(image_np):
+            image_np = np.ascontiguousarray(image_np)
         
-        parameters = self.solver.reconstruct(image)
+        parameters = self.solver.reconstruct(image_np)
         return parameters
