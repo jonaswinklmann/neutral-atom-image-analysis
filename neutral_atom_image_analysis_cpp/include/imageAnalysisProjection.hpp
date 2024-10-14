@@ -13,7 +13,8 @@
 struct Image
 {
     const double *image;
-    size_t offset, outerStride, innerStride;
+    Eigen::Index imageRows, imageCols;
+    size_t outerStride, innerStride;
     // Rounded PSF center coordinates.
     int X_int, Y_int;
     // Rounded PSF rectangle corners.
@@ -29,7 +30,7 @@ class ImageAnalysisProjection : ImageAnalysis
 protected:
     int psfSupersample;
     Eigen::Array2i projShape;
-    std::vector<std::vector<double>> imageProjs;
+    std::vector<std::pair<const std::vector<double>, double>> imageProjs;
 
     std::vector<Image> getLocalImages(
         const py::EigenDRef<const Eigen::Array<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>& fullImage);
@@ -39,5 +40,5 @@ public:
         std::vector<std::tuple<double, double>> atomLocations) : ImageAnalysis(psf, atomLocations)
     {};
     std::vector<double> reconstruct(py::EigenDRef<Eigen::Array<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> image) override;
-    void setProjGen(py::object& prjgen);
+    int setProjGen(py::object& prjgen);
 };

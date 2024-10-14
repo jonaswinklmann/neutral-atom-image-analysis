@@ -3,10 +3,12 @@
 #include <pybind11/numpy.h>
 
 #include <algorithm>
+#include <numeric>
 #include <optional>
 #include <omp.h>
+#include <iostream>
 
-void ImageAnalysisProjection::setProjGen(py::object& prjgen)
+int ImageAnalysisProjection::setProjGen(py::object& prjgen)
 {
     bool projCacheBuilt = prjgen.attr("proj_cache_built").cast<bool>();
     if(!projCacheBuilt)
@@ -18,8 +20,18 @@ void ImageAnalysisProjection::setProjGen(py::object& prjgen)
 
     py::array_t<double, py::array::c_style | py::array::forcecast> projs = prjgen.attr("proj_cache").cast<py::array_t<double>>();
     const pybind11::ssize_t *shape = projs.shape();
+    if(projs.ndim() < 2)
+    {
+        std::cout << "Projection cache does not have sufficiently many dimensions" << std::endl;
+        return -1;
+    }
     projs = projs.reshape(std::vector<int>({(int)(shape[0]), (int)(shape[1]), -1}));
     const pybind11::ssize_t *newShape = projs.shape();
+    if(shape[0] < this->psfSupersample || shape[1] < this->psfSupersample)
+    {
+        std::cout << "Projection cache dimensions 0 or 1 are smaller than psf_supersample" << std::endl;
+        return -2;
+    }
 
     for(int yidx = 0; yidx < this->psfSupersample; yidx++)
     {
@@ -32,9 +44,11 @@ void ImageAnalysisProjection::setProjGen(py::object& prjgen)
             double *ptr = static_cast<double*>(info.ptr);
             imageProj.insert(imageProj.end(), &ptr[0], &ptr[newShape[2]]);
 
-            this->imageProjs.push_back(imageProj);
+            double projSum = std::accumulate(imageProj.begin(), imageProj.end(), 0.0);
+            this->imageProjs.push_back(std::pair<const std::vector<double>,double>(std::move(imageProj), projSum));
         }
     }
+    return 0;
 }
 
 std::vector<double> ImageAnalysisProjection::reconstruct(
@@ -51,8 +65,12 @@ std::vector<Image> ImageAnalysisProjection::getLocalImages(
     // Extracts image subregions and subpixel shifts.
 
     std::vector<Image> localImages;
-    for(const auto& coord : this->atomLocations)
+    localImages.resize(this->atomLocations.size());
+
+#pragma omp parallel for schedule(dynamic,8) shared(localImages)
+    for(size_t i = 0; i < this->atomLocations.size(); i++)
     {
+        const auto& coord = this->atomLocations[i];
         int y_int = (int)std::round(std::get<0>(coord));
         int x_int = (int)std::round(std::get<1>(coord));
         int y_min = y_int - this->projShape[0] / 2;
@@ -62,7 +80,8 @@ std::vector<Image> ImageAnalysisProjection::getLocalImages(
         Image imageN
         {
             .image = fullImage.data(),
-            .offset = (size_t)(y_min * fullImage.cols() + x_min),
+            .imageRows = fullImage.rows(),
+            .imageCols = fullImage.cols(),
             .outerStride = (size_t)(fullImage.cols()),
             .innerStride = 1,
             .X_int = x_int,
@@ -74,7 +93,7 @@ std::vector<Image> ImageAnalysisProjection::getLocalImages(
             .dx = (int)(std::round((std::get<1>(coord) - x_int) * this->psfSupersample)),
             .dy = (int)(std::round((std::get<0>(coord) - y_int) * this->psfSupersample))
         };
-        localImages.push_back(imageN);
+        localImages[i] = imageN;
     }
     return localImages;
 }
@@ -90,17 +109,52 @@ std::vector<double> ImageAnalysisProjection::applyProjectors(std::vector<Image>&
         const Image& localImage = localImages[i];
         int xidx = (localImage.dx + this->psfSupersample) % this->psfSupersample;
         int yidx = (localImage.dy + this->psfSupersample) % this->psfSupersample;
-        const auto& imageProj = imageProjs[yidx * this->psfSupersample + xidx];
-
-        double sum = 0;
-        int rows = localImage.Y_max - localImage.Y_min + 1;
-        int pixelCount = rows * (localImage.X_max - localImage.X_min + 1);
-        for(int p = 0; p < pixelCount; p++)
+        if ((unsigned int)(yidx * this->psfSupersample + xidx) >= imageProjs.size())
         {
-            sum += localImage.image[localImage.offset + (p / rows) * 
-                localImage.outerStride + p % rows] * imageProj[p];
+            std::cout << "Not enough image projections in cache list. Skipping atom site" << std::endl;
+            continue;
         }
-        emissions[i] = sum;
+        const auto& imageProj = imageProjs[yidx * this->psfSupersample + xidx].first;
+        double imageProjSum = imageProjs[yidx * this->psfSupersample + xidx].second;
+
+        double projSumUsed = 0;
+        double sum = 0;
+        int cols = localImage.X_max - localImage.X_min + 1;
+        if ((unsigned int)(cols * (localImage.Y_max - localImage.Y_min + 1)) > imageProj.size())
+        {
+            std::cout << "Not enough values in projection data. Skipping atom site" << std::endl;
+            continue;
+        }
+
+        int row = localImage.Y_min;
+        if(row < 0)
+        {
+            row = 0;
+        }
+        for(; row <= localImage.Y_max && row < localImage.imageRows; row++)
+        {
+            size_t p = (row - localImage.Y_min) * cols;
+            int col = localImage.X_min;
+            if(col < 0)
+            {
+                p -= col;
+                col = 0;
+            }
+            for(; col <= localImage.X_max && col < localImage.imageCols; col++)
+            {
+                sum += localImage.image[row * localImage.outerStride + col] * imageProj[p];
+                projSumUsed += imageProj[p];
+                p++;
+            }
+        }
+        if(projSumUsed > 0)
+        {
+            emissions[i] = sum * (imageProjSum / projSumUsed);
+        }
+        else
+        {
+            emissions[i] = 0;
+        }
     }
     return emissions;
 }

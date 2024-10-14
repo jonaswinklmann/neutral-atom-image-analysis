@@ -19,7 +19,7 @@ from skimage.segmentation import watershed
 from skimage.transform import radon
 from scipy.interpolate import interp1d
 from scipy.ndimage import zoom, shift
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, OptimizeWarning
 from scipy.stats import norm
 from scipy.signal import find_peaks
 import numpy as np
@@ -33,6 +33,9 @@ def three_gaussian_peaks(x, loc, scale, o_scale1, o_scale2, o_scale3, offset):
 def two_gaussians(x, loc1, scale1, f, loc2, scale2):
     return norm.pdf(x, loc = loc1, scale = scale1) * (1 - f) + \
         norm.pdf(x, loc = loc2, scale = scale2) * f
+
+def single_gaussian_peak(x, loc, scale, o_scale1, offset):
+    return offset + norm.pdf(x, loc = loc, scale = scale) * o_scale1
 
 class ImageAnalysis(abc.ABC):
     def __init__(self):
@@ -100,8 +103,19 @@ class ImageAnalysisProjection(ImageAnalysis):
             peak_factor_guess = (result[index] - result[index - 10]) * peak_width_guess
             x_range = range(start_index,end_index)
 
-            popt, _ = curve_fit(three_gaussian_peaks, x_range, result[start_index:end_index], 
-                p0=[index, peak_width_guess, peak_factor_guess, peak_factor_guess, peak_factor_guess, result[start_index]])
+            popt = None
+            try:
+                popt, _ = curve_fit(three_gaussian_peaks, x_range, result[start_index:end_index], 
+                    p0=[index, peak_width_guess, peak_factor_guess, peak_factor_guess, peak_factor_guess, result[start_index]])
+            except (RuntimeError, OptimizeWarning):
+                if popt is None:
+                    try:
+                        popt, _ = curve_fit(single_gaussian_peak, x_range, result[start_index:end_index], 
+                            p0=[index, peak_width_guess, peak_factor_guess, result[start_index]])
+                    except (RuntimeError, OptimizeWarning):
+                        print("All curve fitting for atom site detection failed. Using rough estimate")
+                        popt = [index]
+
             self.spacing[dim] = popt[0]
 
             # Acquire rolling sum over five adjacent elements of projection to smooth over noise
@@ -148,9 +162,12 @@ class ImageAnalysisProjection(ImageAnalysis):
                     result += norm.pdf(x, loc = index + loc_offset, scale = scale) * value * np.sqrt(2 * np.pi)
                 return result
 
-            popt, _ = curve_fit(gaussian, range(len(projection)), projection, p0 = [0, 3])
-            for i in range(len(indices)):
-                indices[i] += popt[0]
+            try:
+                popt, _ = curve_fit(gaussian, range(len(projection)), projection, p0 = [0, 3])
+                for i in range(len(indices)):
+                    indices[i] += popt[0]
+            except (RuntimeError, ValueError, OptimizeWarning):
+                print("Precise subpixel locations could not be established due to curve fit error")
 
             # Save origin and direction of axis along first row/column of atom sites
             # Saved direction is along projection axis, meaning it would be projected onto a point
@@ -221,13 +238,18 @@ class ImageAnalysisProjection(ImageAnalysis):
         # Height of peak gives good estimate for scale
         gaussian_peak_default = 0.3989422804
 
-        popt, _ = curve_fit(two_gaussians, bin_centers, count, p0 = (bin_centers[first_peak_index], gaussian_peak_default / count[first_peak_index], 0.5, \
-            bin_centers[second_peak_index], gaussian_peak_default / count[second_peak_index]))
-
-        # Take all sites where chance of being empty is below threshold
-        threshold = norm.isf(0.001, popt[0], popt[1])
-        if threshold < bin_centers[first_peak_index] or threshold > bin_centers[second_peak_index]:
-            threshold = (bin_centers[first_peak_index] + bin_centers[second_peak_index]) / 2
+        popt = None
+        try:
+            popt, _ = curve_fit(two_gaussians, bin_centers, count, p0 = (bin_centers[first_peak_index], gaussian_peak_default / count[first_peak_index], 0.5, \
+                bin_centers[second_peak_index], gaussian_peak_default / count[second_peak_index]))
+            # Take all sites where chance of being empty is below threshold
+            threshold = norm.isf(0.001, popt[0], popt[1])
+            if threshold < bin_centers[first_peak_index] or threshold > bin_centers[second_peak_index]:
+                threshold = (bin_centers[first_peak_index] + bin_centers[second_peak_index]) / 2
+        except (RuntimeError, ValueError, OptimizeWarning):
+            if popt is None:
+                print("Curve fitting for threshold for psf acquisition failed. Using rough estimate")
+                threshold = (bin_centers[first_peak_index] + bin_centers[second_peak_index]) / 2
 
         # Add (shifted and scaled) image detail to psf 
         psf_radius = np.linalg.norm(np.array(self.atom_locations[0]) - np.array(self.atom_locations[1])) // 2
@@ -260,8 +282,9 @@ class ImageAnalysisProjection(ImageAnalysis):
                         x_max = image_np.shape[1]
                     image_detail = image_np[y_min:y_max,x_min:x_max]
                     image_detail = np.pad(image_detail, padding, mode='constant')
-                    image_detail = shift(image_detail, (np.floor(atom_location) - np.array(atom_location)), order=1)
-                    image_detail = zoom(image_detail, self.psf_supersample, order=1)
+                    image_detail = zoom(image_detail, self.psf_supersample, order=0)
+                    image_detail = shift(image_detail, self.psf_supersample * (np.floor(atom_location) - np.array(atom_location)), order=1)
+                        
                     self.psf += image_detail[:-self.psf_supersample,:-self.psf_supersample]
         self.psf = self.psf / np.max(self.psf)
 
@@ -279,10 +302,10 @@ class ImageAnalysisProjection(ImageAnalysis):
             else:
                 average_filled_image += image_np
 
-        if average_closed_shutter_image is None:
-            average_closed_shutter_image = np.full(image_np.shape, np.median(image_np))
-
         average_filled_image /= len(images)
+
+        if average_closed_shutter_image is None:
+            average_closed_shutter_image = np.full(image_np.shape, np.median(average_filled_image))
 
         # Subtract closed-shutter image to reduce pixel and row noise and clamp image at 0
         average_filled_image -= average_closed_shutter_image
@@ -364,11 +387,11 @@ class ImageAnalysisProjection(ImageAnalysis):
                 image_np = image.to_numpy(np.float64)
             else:
                 image_np = np.array(image).astype(np.float64)
-            parameters.extend(self.reconstruct(image_np))
+            parameters.extend(self._reconstruct(image_np))
         if self.print_info:
             print("All images reconstructed within " + str((datetime.now() - start_time_reconstruct).total_seconds() * 1e3) + "ms")
 
-        # Find detection threshold
+        # Prepare histogram for threshold detection
         count, bin_edges = np.histogram(parameters, bins=int(np.sqrt(len(parameters))))
         bin_size = bin_edges[1] - bin_edges[0]
         count = np.array(count).astype(np.float64) / len(parameters) / bin_size
@@ -385,8 +408,20 @@ class ImageAnalysisProjection(ImageAnalysis):
 
         # Fit gaussian to acquire distributions
         gaussian_peak_default = 0.3989422804
-        popt, _ = curve_fit(two_gaussians, bin_centers, count, p0 = (bin_centers[first_peak_index], gaussian_peak_default / count[first_peak_index], 0.5, \
-            bin_centers[second_peak_index], gaussian_peak_default / count[second_peak_index]))
+        popt = None
+        try:
+            popt, _ = curve_fit(two_gaussians, bin_centers, count, p0 = (bin_centers[first_peak_index], gaussian_peak_default / count[first_peak_index], 0.5, \
+                bin_centers[second_peak_index], gaussian_peak_default / count[second_peak_index]))
+        except ValueError:
+            print("Either ydata or xdata contained NaNs, or incompatible options were used for curve_fitting for threshold detection! Using rough estimations")
+            popt = [bin_centers[first_peak_index], gaussian_peak_default / count[first_peak_index], bin_centers[second_peak_index], gaussian_peak_default / count[second_peak_index]]
+        except RuntimeError:
+            print("The least-squares minimization failed for curve_fitting for threshold detection! Using rough estimations")
+            popt = [bin_centers[first_peak_index], gaussian_peak_default / count[first_peak_index], bin_centers[second_peak_index], gaussian_peak_default / count[second_peak_index]]
+        except OptimizeWarning:
+            print("The covariance of the parameters could not be estimated for curve_fitting for threshold detection!")
+            if popt is None:
+                popt = [bin_centers[first_peak_index], gaussian_peak_default / count[first_peak_index], bin_centers[second_peak_index], gaussian_peak_default / count[second_peak_index]]
         
         # Check that peaks are in correct order
         if(popt[0] < popt[3]):
@@ -412,26 +447,31 @@ class ImageAnalysisProjection(ImageAnalysis):
         a = 1 / (2 * sigma2**2) - 1 / (2 * sigma1**2)
         b = first_peak / (sigma1**2) - second_peak / (sigma2**2)
         c = (second_peak**2) / (2 * sigma2**2) - (first_peak**2) / (2 * sigma1**2) + math.log(((1 - calibration_filling_ratio) * sigma2) / (calibration_filling_ratio * sigma1))
-        s = math.sqrt(b**2 - 4 * a * c)
+        d = b**2 - 4 * a * c
+        if d < 0:
+            print("No intersection between curves. Setting threshold to middle between two peaks")
+            self.threshold = (first_peak + second_peak) / 2
+        else:
+            s = math.sqrt(d)
 
-        threshold = (-b-s) / (2 * a)
-        if threshold < first_peak or threshold > second_peak:
-            threshold = (-b+s) / (2 * a)
+            self.threshold = (-b-s) / (2 * a)
+            if self.threshold < first_peak or self.threshold > second_peak:
+                self.threshold = (-b+s) / (2 * a)
 
-        fidelity0 = norm.cdf(threshold, loc = first_peak, scale = sigma1)
-        fidelity1 = norm.sf(threshold, loc = second_peak, scale = sigma2)
+        fidelity0 = norm.cdf(self.threshold, loc = first_peak, scale = sigma1)
+        fidelity1 = norm.sf(self.threshold, loc = second_peak, scale = sigma2)
         fidelity = (1 - calibration_filling_ratio) * fidelity0 + calibration_filling_ratio * fidelity1
 
         if self.print_info:
-            print("Threshold: " + str(threshold))
+            print("Threshold: " + str(self.threshold))
             print("F0: " + str(fidelity0))
             print("F1: " + str(fidelity1))
             print("F: " + str(fidelity))
             print("Calibration finished, total time: " + str((datetime.now() - start_time).total_seconds() * 1e3) + "ms")
 
-        return threshold, [first_peak, second_peak], fidelity, fidelity0, fidelity1, calibration_filling_ratio, filling_ratio
+        return self.threshold, [first_peak, second_peak], fidelity, fidelity0, fidelity1, calibration_filling_ratio, filling_ratio
 
-    def reconstruct(self, image):
+    def _reconstruct(self, image):
         # Preprocess image
         if isinstance(image, DataFrame):
             image_np = image.to_numpy(np.float64)
@@ -442,3 +482,8 @@ class ImageAnalysisProjection(ImageAnalysis):
         
         parameters = self.solver.reconstruct(image_np)
         return parameters
+
+    def reconstruct(self, image):
+        parameters = self._reconstruct(image)
+        return parameters, parameters > self.threshold
+    
