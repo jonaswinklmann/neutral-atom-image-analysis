@@ -56,7 +56,7 @@ class ImageAnalysisProjection(ImageAnalysis):
         self.psf_supersample = psf_supersample
         self.print_info = print_info
 
-    def _find_atom_locations(self, average_image, angle_guesses):
+    def _find_atom_locations(self, average_image, site_detection_threshold):
         target_axes = [90,0]
         origins_first_peak_axes = []
         dirs_first_peak_axes = []
@@ -66,16 +66,28 @@ class ImageAnalysisProjection(ImageAnalysis):
         self.spacing = [0,0]
         self.sites_shape = [0,0]
 
+        shape = average_image.shape
+        padding = None
+        if shape[0] < shape[1]:
+            before_padding = (shape[1] - shape[0]) // 2
+            padding = ((before_padding, (shape[1] - shape[0]) - before_padding), (0,0))
+        elif shape[1] < shape[0]:
+            before_padding = (shape[0] - shape[1]) // 2
+            padding = ((0,0), (before_padding, (shape[0] - shape[1]) - before_padding))
+        else:
+            padding = ((0,0),(0,0))
+        padded_average_image = np.pad(average_image, padding)
+
         # Handle both dimensions separately starting from a rough guess of the angle
         for dim in range(2):
             # Find the best suited angle within +- 15 degrees
-            tested_angles = np.linspace(angle_guesses[dim] - 15, angle_guesses[dim] + 15, 101)
-            h = radon(average_image, theta=tested_angles)
+            tested_angles = np.linspace(target_axes[dim] - 15, target_axes[dim] + 15, 101)
+            h = radon(padded_average_image, theta=tested_angles, preserve_range=True)
             highest_var_index = np.argmax(np.var(h, axis=0))
 
             # Find more precise angle within +- 1 degree of approx angle
             tested_angles = np.linspace(tested_angles[highest_var_index] - 1, tested_angles[highest_var_index] + 1, 101)
-            h = radon(average_image, theta=tested_angles)
+            h = radon(padded_average_image, theta=tested_angles, preserve_range=True)
             highest_var_index = np.argmax(np.var(h, axis=0))
 
             self.angle[dim] = target_axes[dim] - tested_angles[highest_var_index]
@@ -137,7 +149,8 @@ class ImageAnalysisProjection(ImageAnalysis):
 
             # At the given periodic locations, take all that are at least 1/e times the maximum 
             # or that lie in the middle of locations where that is the case
-            threshold = maximizing_values.max() / np.e
+            # Allow sites on the edge to be only above half threshold if they are the maximum or minimum of diff of values
+            threshold = maximizing_values.max() * site_detection_threshold
             for i, value in enumerate(maximizing_values):
                 if value >= threshold:
                     start_index = i
@@ -171,9 +184,9 @@ class ImageAnalysisProjection(ImageAnalysis):
 
             # Save origin and direction of axis along first row/column of atom sites
             # Saved direction is along projection axis, meaning it would be projected onto a point
-            origin_loc = np.array((average_image.shape[0] // 2, average_image.shape[1] // 2)).astype(np.float64)
+            origin_loc = np.array((padded_average_image.shape[0] // 2, padded_average_image.shape[1] // 2)).astype(np.float64)
             proj_vector = np.array((-np.sin(np.deg2rad(tested_angles[highest_var_index])), np.cos(np.deg2rad(tested_angles[highest_var_index]))))
-            origin_loc += (indices[0] - float(average_image.shape[0] // 2)) * proj_vector
+            origin_loc += (indices[0] - float(padded_average_image.shape[0] // 2)) * proj_vector
             origins_first_peak_axes.append(origin_loc)
             direction = np.array([np.cos(np.deg2rad(tested_angles[highest_var_index])), np.sin(np.deg2rad(tested_angles[highest_var_index]))])
             dirs_first_peak_axes.append(direction)
@@ -191,9 +204,9 @@ class ImageAnalysisProjection(ImageAnalysis):
 
         # Calculate list of atom sites
         self.atom_locations = []
-        for c in range(self.sites_shape[0]):
-            for r in range(self.sites_shape[1]):
-                location = self._image_ref + c * self.spacing[0] * proj_vectors[0] + r * self.spacing[1] * proj_vectors[1]
+        for r in range(self.sites_shape[0]):
+            for c in range(self.sites_shape[1]):
+                location = self._image_ref + r * self.spacing[0] * proj_vectors[0] + c * self.spacing[1] * proj_vectors[1] - np.array([padding[0][0], padding[1][0]])
                 if min(location) >= 0 and location[0] <= average_image.shape[0] - 1 and location[1] <= average_image.shape[1] - 1:
                     self.atom_locations.append(location)
     
@@ -253,6 +266,10 @@ class ImageAnalysisProjection(ImageAnalysis):
 
         # Add (shifted and scaled) image detail to psf 
         psf_radius = np.linalg.norm(np.array(self.atom_locations[0]) - np.array(self.atom_locations[1])) // 2
+        for i in range(1, len(self.atom_locations)):
+            half_dist = np.linalg.norm(np.array(self.atom_locations[0]) - np.array(self.atom_locations[i])) // 2
+            if half_dist < psf_radius:
+                psf_radius = half_dist
         psf_size = int((2 * psf_radius + 1) * self.psf_supersample)
         self.psf = np.zeros((psf_size,psf_size))
         for image in images:
@@ -288,7 +305,8 @@ class ImageAnalysisProjection(ImageAnalysis):
                     self.psf += image_detail[:-self.psf_supersample,:-self.psf_supersample]
         self.psf = self.psf / np.max(self.psf)
 
-    def calibrate(self, images, average_closed_shutter_image = None, angle_guesses : tuple[float,float] = (90,0), proj_shape : tuple[int,int] = (61, 61), use_measured_loading_rate = True):
+    def calibrate(self, images, average_closed_shutter_image = None, proj_shape : tuple[int,int] = (61, 61), 
+        use_measured_loading_rate = True, min_cal_samples = None, site_detection_threshold = 0.2):
         start_time = datetime.now()
         first = True
         for image in images:
@@ -305,29 +323,39 @@ class ImageAnalysisProjection(ImageAnalysis):
         average_filled_image /= len(images)
 
         if average_closed_shutter_image is None:
-            average_closed_shutter_image = np.full(image_np.shape, np.median(average_filled_image))
+            average_closed_shutter_image = np.zeros_like(image_np)
+            for row in range(average_filled_image.shape[0]):
+                average_closed_shutter_image[row,...] += np.median(average_filled_image[row,...])
+            for col in range(average_filled_image.shape[1]):
+                average_closed_shutter_image[...,col] += np.median((average_filled_image - average_closed_shutter_image)[...,col])
 
         # Subtract closed-shutter image to reduce pixel and row noise and clamp image at 0
         average_filled_image -= average_closed_shutter_image
-        average_filled_image[average_filled_image < 0] = 0
+        #average_filled_image[average_filled_image < 0] = 0
 
         if self.print_info:
-            print("Acquring atom locations")
-        self._find_atom_locations(average_filled_image, angle_guesses)
+            print("Acquiring atom locations")
+        self._find_atom_locations(average_filled_image, site_detection_threshold)
         if self.print_info:
-            print("Acquring PSF")
+            print("Atom_locations: " + str(self.atom_locations))
+            plt.imshow(average_filled_image)
+            plt.title("Average image with detected atom locations")
+            for loc in self.atom_locations:
+                plt.plot(loc[1], loc[0], marker='x', color="red") 
+            plot.show()
+            print("Acquiring PSF")
         self._find_psf(images, average_closed_shutter_image)
 
         if self.print_info:
-            print("Full scale PSF: ")
             plt.imshow(self.psf)
+            plt.title("Full scale PSF")
             plt.show()
 
         trafo_site_to_image = AffineTrafo2d()
         # Set site unit vectors within image coordinate system
         trafo_site_to_image.set_origin_axes(
-            magnification=self.spacing,
-            angle=np.deg2rad(self.angle)
+            magnification=(self.spacing[1],self.spacing[0]),
+            angle=np.deg2rad((self.angle[1],self.angle[0]))
         )
         trafo_site_to_image.set_offset_by_point_pair(
             [0,0], self._image_ref
@@ -345,7 +373,6 @@ class ImageAnalysisProjection(ImageAnalysis):
                 for j in range(self.psf_supersample):
                     ax[i,j].imshow(ipsf_gen.generate_integrated_psf(i - half_supersample, j - half_supersample))
             fig.show()
-            plt.show()
 
         proj_gen = state_reconstruction.ProjectorGenerator(
             trafo_site_to_image=trafo_site_to_image,
@@ -357,18 +384,17 @@ class ImageAnalysisProjection(ImageAnalysis):
         proj_gen.setup_cache(print_progress=True)
 
         if self.print_info:
-            print("Integrated projector(s):")
             if self.psf_supersample > 1:
+                print("Integrated projector(s):")
                 fig, ax = plt.subplots(self.psf_supersample, self.psf_supersample)
-                
                 half_supersample = self.psf_supersample // 2
                 for i in range(self.psf_supersample):
                     for j in range(self.psf_supersample):
                         fig.colorbar(ax[i,j].imshow(proj_gen.proj_cache[i,j]), ax = ax[i,j])
                 fig.show()
-                plt.show()
             else:
                 plt.imshow(proj_gen.proj_cache[0, 0])
+                plt.title("Integrated projector")
                 plt.colorbar()
                 plt.show()
 
@@ -379,6 +405,62 @@ class ImageAnalysisProjection(ImageAnalysis):
         self.solver.setProjGen(proj_gen)
 
         parameters = []
+        self.threshold = [0] * len(self.atom_locations)
+        atom_site_index_to_parameter_index = []
+
+        # Group atom sites together spatially
+        # TODO
+        if min_cal_samples is None or len(images) >= min_cal_samples:
+            for i in range(len(self.atom_locations)):
+                parameters.append([])
+                atom_site_index_to_parameter_index.append(i)
+        else:
+            atom_site_cluster_size = np.ceil(min_cal_samples / len(images))
+            if atom_site_cluster_size > len(self.atom_locations) // 2:
+                parameters.append([])
+                atom_site_index_to_parameter_index = [0] * len(self.atom_locations)
+            else:
+                rows_in_group = 1
+                cols_in_group = 1
+                row_group_size = 0
+                col_group_size = 0
+                while rows_in_group * cols_in_group < atom_site_cluster_size:
+                    potential_new_row_size = row_group_size + self.spacing[0]
+                    potential_new_col_size = col_group_size + self.spacing[1]
+                    if potential_new_row_size < potential_new_col_size or \
+                        (potential_new_row_size == potential_new_col_size and \
+                        rows_in_group < cols_in_group):
+                        if rows_in_group + 1 > self.sites_shape[0] // 2:
+                            rows_in_group = self.sites_shape[0]
+                            cols_in_group = int(np.ceil(atom_site_cluster_size / rows_in_group))
+                            break
+                        else:
+                            rows_in_group += 1
+                            row_group_size = potential_new_row_size
+                    else:
+                        if cols_in_group + 1 > self.sites_shape[1] // 2:
+                            cols_in_group = self.sites_shape[1]
+                            rows_in_group = int(np.ceil(atom_site_cluster_size / cols_in_group))
+                            break
+                        else:
+                            cols_in_group += 1
+                            col_group_size = potential_new_col_size
+                print(str(rows_in_group) + "; " + str(cols_in_group))
+                if self.print_info:
+                    print("Grouping atom sites together to get sufficient data points")
+                    print("Rows in group: " + str(rows_in_group))
+                    print("Cols in group: " + str(cols_in_group))
+
+                row_groups = np.array_split(range(self.sites_shape[0]), self.sites_shape[0] // rows_in_group)
+                col_groups = np.array_split(range(self.sites_shape[1]), self.sites_shape[1] // cols_in_group)
+                atom_site_index_to_parameter_index = [0] * len(self.atom_locations)
+                for row_group in row_groups:
+                    for col_group in col_groups:
+                        parameter_index = len(parameters)
+                        parameters.append([])
+                        for r in row_group:
+                            for c in col_group:
+                                atom_site_index_to_parameter_index[r * self.sites_shape[1] + c] = parameter_index
 
         # Reconstruct all test images to find best threshold
         start_time_reconstruct = datetime.now()
@@ -387,89 +469,132 @@ class ImageAnalysisProjection(ImageAnalysis):
                 image_np = image.to_numpy(np.float64)
             else:
                 image_np = np.array(image).astype(np.float64)
-            parameters.extend(self._reconstruct(image_np))
+            result = self._reconstruct(image_np)
+            for i in range(len(self.atom_locations)):
+                parameters[atom_site_index_to_parameter_index[i]].append(result[i])
         if self.print_info:
             print("All images reconstructed within " + str((datetime.now() - start_time_reconstruct).total_seconds() * 1e3) + "ms")
 
-        # Prepare histogram for threshold detection
-        count, bin_edges = np.histogram(parameters, bins=int(np.sqrt(len(parameters))))
-        bin_size = bin_edges[1] - bin_edges[0]
-        count = np.array(count).astype(np.float64) / len(parameters) / bin_size
-        bin_centers = (np.array(bin_edges[:-1]) + np.array(bin_edges[1:])) / 2
+        fidelities = []
+        fidelities0 = []
+        fidelities1 = []
 
-        # Find guesses for Gaussian fit
-        peaks, properties = find_peaks(count, prominence=0.00001)
+        for p_index, parameters_individual in enumerate(parameters):
+            # Prepare histogram for threshold detection
+            count, bin_edges = np.histogram(parameters_individual, bins=int(np.sqrt(len(parameters_individual))))
+            bin_size = bin_edges[1] - bin_edges[0]
+            count = np.array(count).astype(np.float64) / len(parameters_individual) / bin_size
+            bin_centers = (np.array(bin_edges[:-1]) + np.array(bin_edges[1:])) / 2
 
-        peak_index_in_peaks = np.argmax(properties['prominences'])
-        first_peak_index = peaks[peak_index_in_peaks]
-        properties['prominences'][peak_index_in_peaks] = 0
-        peak_index_in_peaks = np.argmax(properties['prominences'])
-        second_peak_index = peaks[peak_index_in_peaks]
+            first_peak_index = np.argmax(count)
+            min_index = first_peak_index + np.argmax(np.diff(count[first_peak_index:]) > 0)
+            second_peak_index = (min_index + np.argmax(count[min_index:]))
+            rough_treshold = (bin_centers[second_peak_index] + bin_centers[first_peak_index]) / 2
 
-        # Fit gaussian to acquire distributions
-        gaussian_peak_default = 0.3989422804
-        popt = None
-        try:
-            popt, _ = curve_fit(two_gaussians, bin_centers, count, p0 = (bin_centers[first_peak_index], gaussian_peak_default / count[first_peak_index], 0.5, \
-                bin_centers[second_peak_index], gaussian_peak_default / count[second_peak_index]))
-        except ValueError:
-            print("Either ydata or xdata contained NaNs, or incompatible options were used for curve_fitting for threshold detection! Using rough estimations")
-            popt = [bin_centers[first_peak_index], gaussian_peak_default / count[first_peak_index], bin_centers[second_peak_index], gaussian_peak_default / count[second_peak_index]]
-        except RuntimeError:
-            print("The least-squares minimization failed for curve_fitting for threshold detection! Using rough estimations")
-            popt = [bin_centers[first_peak_index], gaussian_peak_default / count[first_peak_index], bin_centers[second_peak_index], gaussian_peak_default / count[second_peak_index]]
-        except OptimizeWarning:
-            print("The covariance of the parameters could not be estimated for curve_fitting for threshold detection!")
-            if popt is None:
-                popt = [bin_centers[first_peak_index], gaussian_peak_default / count[first_peak_index], bin_centers[second_peak_index], gaussian_peak_default / count[second_peak_index]]
-        
-        # Check that peaks are in correct order
-        if(popt[0] < popt[3]):
+            parameters_empty = [p for p in parameters_individual if p <= rough_treshold]
+            parameters_occ = [p for p in parameters_individual if p >= rough_treshold]
+
+            count_empty, bin_edges_empty = np.histogram(parameters_empty, bins=int(np.sqrt(len(parameters_empty))))
+            bin_size_empty = bin_edges_empty[1] - bin_edges_empty[0]
+            count_empty = np.pad(np.array(count_empty).astype(np.float64) / len(parameters_individual) / bin_size_empty, (1,1), mode='constant')
+            bin_centers_empty = np.pad((np.array(bin_edges_empty[:-1]) + np.array(bin_edges_empty[1:])) / 2, (1,1))
+            bin_centers_empty[0] = bin_centers_empty[1] - bin_size_empty
+            bin_centers_empty[-1] = bin_centers_empty[-2] + bin_size_empty
+
+            count_occ, bin_edges_occ = np.histogram(parameters_occ, bins=int(np.sqrt(len(parameters_occ))))
+            bin_size_occ = bin_edges_occ[1] - bin_edges_occ[0]
+            count_occ = np.pad(np.array(count_occ).astype(np.float64) / len(parameters_individual) / bin_size_occ, (1,1), mode='constant')
+            bin_centers_occ = np.pad((np.array(bin_edges_occ[:-1]) + np.array(bin_edges_occ[1:])) / 2, (1,1))
+            bin_centers_occ[0] = bin_centers_occ[1] - bin_size_occ
+            bin_centers_occ[-1] = bin_centers_occ[-2] + bin_size_occ
+
+            # Find guesses for Gaussian fit
+            peaks, properties = find_peaks(count_empty, prominence=0.00001)
+            peak_index_in_peaks = np.argmax(properties['prominences'])
+            first_peak_index = peaks[peak_index_in_peaks]
+            peaks, properties = find_peaks(count_occ, prominence=0.00001)
+            peak_index_in_peaks = np.argmax(properties['prominences'])
+            second_peak_index = peaks[peak_index_in_peaks]
+
+            # Fit gaussian to acquire distributions
+            gaussian_peak_default = 0.3989422804
+            popt = None
+            all_x = np.concatenate([bin_centers_empty,bin_centers_occ])
+            all_y = np.concatenate([count_empty,count_occ])
+            popt_guesses = [bin_centers_empty[first_peak_index], gaussian_peak_default / count_empty[first_peak_index],\
+                0.5, bin_centers_occ[second_peak_index], gaussian_peak_default / count_occ[second_peak_index]]
+            try:
+                popt, _ = curve_fit(two_gaussians, all_x, all_y, p0 = popt_guesses, \
+                    bounds=([bin_centers_empty[0], 0, 0, rough_treshold, 0],\
+                            [rough_treshold, np.inf, 1, bin_centers_occ[-1], np.inf]))
+            except ValueError:
+                print("Either ydata or xdata contained NaNs, or incompatible options were used for curve_fitting for threshold detection! Using rough estimations")
+                popt = popt_guesses
+            except RuntimeError:
+                print("The least-squares minimization failed for curve_fitting for threshold detection! Using rough estimations")
+                popt = popt_guesses
+            except OptimizeWarning:
+                print("The covariance of the parameters could not be estimated for curve_fitting for threshold detection!")
+                if popt is None:
+                    popt = popt_guesses
+
             first_peak = popt[0]
             sigma1 = popt[1]
-            filling_ratio = popt[2]
+            filling_ratio = popt[2]            
             second_peak = popt[3]
             sigma2 = popt[4]
-        else:
-            second_peak = popt[0]
-            sigma2 = popt[1]
-            filling_ratio = 1 - popt[2]
-            first_peak = popt[3]
-            sigma1 = popt[4]
 
-        # Use measured filling ratio or 0.5 if use_measured_loading_rate == False
-        if use_measured_loading_rate:
-            calibration_filling_ratio = filling_ratio
-        else:
-            calibration_filling_ratio = 0.5
+            # Use measured filling ratio or 0.5 if use_measured_loading_rate == False
+            if use_measured_loading_rate:
+                calibration_filling_ratio = filling_ratio
+            else:
+                calibration_filling_ratio = 0.5
 
-        # Calculate threshold so that weighted pdf is equal, i.e. minimize total error for given filling ratio
-        a = 1 / (2 * sigma2**2) - 1 / (2 * sigma1**2)
-        b = first_peak / (sigma1**2) - second_peak / (sigma2**2)
-        c = (second_peak**2) / (2 * sigma2**2) - (first_peak**2) / (2 * sigma1**2) + math.log(((1 - calibration_filling_ratio) * sigma2) / (calibration_filling_ratio * sigma1))
-        d = b**2 - 4 * a * c
-        if d < 0:
-            print("No intersection between curves. Setting threshold to middle between two peaks")
-            self.threshold = (first_peak + second_peak) / 2
-        else:
-            s = math.sqrt(d)
+            # Calculate threshold so that weighted pdf is equal, i.e. minimize total error for given filling ratio
+            a = 1 / (2 * sigma2**2) - 1 / (2 * sigma1**2)
+            if a == 0 or sigma1 == 0 or sigma2 == 0 or calibration_filling_ratio == 0 or \
+                ((1 - calibration_filling_ratio) * sigma2) / (calibration_filling_ratio * sigma1) <= 0:
+                print("Division by zero. Setting threshold to middle between two peaks")
+                t = (first_peak + second_peak) / 2
+            else:
+                b = first_peak / (sigma1**2) - second_peak / (sigma2**2)
+                c = (second_peak**2) / (2 * sigma2**2) - (first_peak**2) / (2 * sigma1**2) + math.log(((1 - calibration_filling_ratio) * sigma2) / (calibration_filling_ratio * sigma1))
+                d = b**2 - 4 * a * c
+                if d < 0:
+                    print("No intersection between curves. Setting threshold to middle between two peaks")
+                    t = (first_peak + second_peak) / 2
+                else:
+                    s = math.sqrt(d)
 
-            self.threshold = (-b-s) / (2 * a)
-            if self.threshold < first_peak or self.threshold > second_peak:
-                self.threshold = (-b+s) / (2 * a)
+                    t = (-b-s) / (2 * a)
+                    if t < first_peak or t > second_peak:
+                        t = (-b+s) / (2 * a)
 
-        fidelity0 = norm.cdf(self.threshold, loc = first_peak, scale = sigma1)
-        fidelity1 = norm.sf(self.threshold, loc = second_peak, scale = sigma2)
-        fidelity = (1 - calibration_filling_ratio) * fidelity0 + calibration_filling_ratio * fidelity1
+            all_data_points = np.concatenate([bin_centers_empty, bin_centers_occ])
+            plt.plot(bin_centers_empty, count_empty)
+            plt.plot(bin_centers_occ, count_occ)
+            plt.plot(all_data_points, two_gaussians(all_data_points, first_peak, sigma1, filling_ratio, second_peak, sigma2))
+            plt.vlines([t], 0, count.max(), colors=['red'])
+            plt.legend(['All count', 'Empty count', 'Occ count', 'Total fit'])
+            plt.show()
+
+            for atom_location_index, parameter_index in enumerate(atom_site_index_to_parameter_index):
+                if parameter_index == p_index:
+                    self.threshold[atom_location_index] = t
+
+            fidelity0 = norm.cdf(t, loc = first_peak, scale = sigma1)
+            fidelities0.append(fidelity0)
+            fidelity1 = norm.sf(t, loc = second_peak, scale = sigma2)
+            fidelities1.append(fidelity1)
+            fidelities.append((1 - calibration_filling_ratio) * fidelity0 + calibration_filling_ratio * fidelity1)
 
         if self.print_info:
-            print("Threshold: " + str(self.threshold))
-            print("F0: " + str(fidelity0))
-            print("F1: " + str(fidelity1))
-            print("F: " + str(fidelity))
+            print("F0 avg: " + str(np.average(fidelities0)))
+            print("F1 avg: " + str(np.average(fidelities1)))
+            print("F avg: " + str(np.average(fidelities)))
             print("Calibration finished, total time: " + str((datetime.now() - start_time).total_seconds() * 1e3) + "ms")
 
-        return self.threshold, [first_peak, second_peak], fidelity, fidelity0, fidelity1, calibration_filling_ratio, filling_ratio
+        return self.threshold, [first_peak, second_peak], fidelities, fidelities0, fidelities1, calibration_filling_ratio, filling_ratio
 
     def _reconstruct(self, image):
         # Preprocess image
@@ -485,5 +610,5 @@ class ImageAnalysisProjection(ImageAnalysis):
 
     def reconstruct(self, image):
         parameters = self._reconstruct(image)
-        return parameters, parameters > self.threshold
+        return parameters, [parameters[i] > self.threshold[i] for i in range(len(self.atom_locations))]
     
