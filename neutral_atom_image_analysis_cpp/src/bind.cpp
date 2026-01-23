@@ -12,5 +12,6 @@ PYBIND11_MODULE(neutral_atom_image_analysis_cpp, m) {
         .def(py::init<const py::EigenDRef<const Eigen::Array<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>&, 
             std::vector<std::tuple<double, double>>>())
         .def("reconstruct", &ImageAnalysisProjection::reconstruct, py::arg("image"))
-        .def("setProjGen", &ImageAnalysisProjection::setProjGen, py::arg("prjgen"));
+        .def("setProjectors", &ImageAnalysisProjection::setProjectors, py::arg("prjgen"))
+        .def("setProjectorsFromArray", &ImageAnalysisProjection::setProjectorsFromArray, py::arg("projectors"));
 }

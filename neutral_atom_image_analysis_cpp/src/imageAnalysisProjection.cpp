@@ -8,7 +8,7 @@
 #include <omp.h>
 #include <iostream>
 
-int ImageAnalysisProjection::setProjGen(py::object& prjgen)
+int ImageAnalysisProjection::setProjectors(py::object& prjgen)
 {
     bool projCacheBuilt = prjgen.attr("proj_cache_built").cast<bool>();
     if(!projCacheBuilt)
@@ -40,6 +40,66 @@ int ImageAnalysisProjection::setProjGen(py::object& prjgen)
             std::vector<double> imageProj;
 
             py::array proj = projs[py::make_tuple(xidx, yidx, py::ellipsis())];
+            py::buffer_info info = proj.request();
+            double *ptr = static_cast<double*>(info.ptr);
+            imageProj.insert(imageProj.end(), &ptr[0], &ptr[newShape[2]]);
+
+            double projSum = std::accumulate(imageProj.begin(), imageProj.end(), 0.0);
+            this->imageProjs.push_back(std::pair<const std::vector<double>,double>(std::move(imageProj), projSum));
+        }
+    }
+    return 0;
+}
+
+int ImageAnalysisProjection::setProjectorsFromArray(py::array_t<double> projectors)
+{
+    const pybind11::ssize_t *shape = projectors.shape();
+    if(projectors.ndim() == 2)
+    {
+        this->psfSupersample = 1;
+        this->projShape = Eigen::Array2i(shape[0], shape[1]);
+    }
+    else if(projectors.ndim() == 3)
+    {
+        int psfSupersampleGuess = sqrt((int)shape[0]);
+        if(!(psfSupersampleGuess * psfSupersampleGuess == (int)shape[0]))
+        {
+            std::cout << "If projector array has 3 dimensions, then the first should be a square of size psf_supersize * psf_supersize" << std::endl;
+            return -3;
+        }
+        this->psfSupersample = psfSupersampleGuess;
+        this->projShape = Eigen::Array2i(shape[1], shape[2]);
+    }
+    else if(projectors.ndim() >= 4)
+    {
+        if(shape[0] != shape[1])
+        {
+            std::cout << "Projection cache dimensions 0 and 1 not equal" << std::endl;
+            return -2;
+        }
+        this->psfSupersample = shape[0];
+        this->projShape = Eigen::Array2i(shape[2], shape[3]);
+    }
+    else
+    {
+        std::cout << "Projection cache does not have sufficiently many dimensions" << std::endl;
+        return -1;
+    }
+    py::array_t<double> reshapedArray = projectors.reshape(std::vector<int>({this->psfSupersample, this->psfSupersample, -1}));
+    const pybind11::ssize_t *newShape = reshapedArray.shape();
+    if(shape[0] < this->psfSupersample || shape[1] < this->psfSupersample)
+    {
+        std::cout << "Projection cache dimensions 0 or 1 are smaller than psf_supersample" << std::endl;
+        return -2;
+    }
+
+    for(int yidx = 0; yidx < this->psfSupersample; yidx++)
+    {
+        for(int xidx = 0; xidx < this->psfSupersample; xidx++)
+        {
+            std::vector<double> imageProj;
+
+            py::array proj = reshapedArray[py::make_tuple(xidx, yidx, py::ellipsis())];
             py::buffer_info info = proj.request();
             double *ptr = static_cast<double*>(info.ptr);
             imageProj.insert(imageProj.end(), &ptr[0], &ptr[newShape[2]]);

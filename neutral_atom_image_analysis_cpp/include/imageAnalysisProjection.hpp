@@ -40,5 +40,6 @@ public:
         std::vector<std::tuple<double, double>> atomLocations) : ImageAnalysis(psf, atomLocations)
     {};
     std::vector<double> reconstruct(py::EigenDRef<Eigen::Array<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> image) override;
-    int setProjGen(py::object& prjgen);
+    int setProjectors(py::object& prjgen);
+    int setProjectorsFromArray(py::array_t<double> projectors);
 };

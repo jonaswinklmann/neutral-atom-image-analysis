@@ -11,6 +11,8 @@ from datetime import datetime
 import math
 import neutral_atom_image_analysis_cpp
 import state_reconstruction
+from state_reconstruction.gen.image_gen import get_local_psfs
+from state_reconstruction.gen.proj_gen import get_embedded_local_psfs, get_embedded_projectors, crop_projector
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from libics.tools import plot
@@ -23,7 +25,7 @@ from scipy.ndimage import zoom, shift
 from scipy.optimize import curve_fit, OptimizeWarning
 from scipy.stats import norm
 from scipy.signal import find_peaks
-from scipy.spatial import Voronoi, voronoi_plot_2d
+from scipy.spatial import Voronoi, voronoi_plot_2d, distance
 import numpy as np
 import abc
 
@@ -85,8 +87,8 @@ class ImageAnalysisProjection(ImageAnalysis):
                 break
         return tested_angles[highest_var_index], h[...,highest_var_index].flatten()
 
-    def _find_atom_locations(self, average_image, site_detection_threshold, extend_locations_to_fov, closed_shutter_image_provided):
-        target_axes = [90,0]
+    def _find_atom_locations(self, average_image, site_detection_threshold, extend_locations_to_fov, 
+                             closed_shutter_image_provided, target_axes):
         origins_first_peak_axes = []
         dirs_first_peak_axes = []
 
@@ -562,9 +564,6 @@ class ImageAnalysisProjection(ImageAnalysis):
                     border_mask = second_closest_val < psf_distance_mult * closest_val
                     voronoi[border_mask] = -1
                     complete_voronoi[start_index[0]:end_index[0],start_index[1]:end_index[1]] = voronoi[overlap_dist:-overlap_dist,overlap_dist:-overlap_dist]
-
-            #plt.imshow(complete_voronoi, cmap=mpl.colormaps['Greys'], norm=mpl.colors.TwoSlopeNorm(0))
-            #plt.show()
             
             mask = np.ones_like(self.psf, bool)
             for i, atom_location in enumerate(occupied_atom_locations):
@@ -614,10 +613,7 @@ class ImageAnalysisProjection(ImageAnalysis):
                 self.psf[y,x] = 0
         self.psf = self.psf / np.max(self.psf)
 
-    def calibrate(self, images, average_closed_shutter_image = None, proj_shape : tuple[int,int] = None, 
-        use_measured_loading_rate = True, min_cal_samples = None, site_detection_threshold = 0.2, 
-        extend_locations_to_fov = False, psf_distance_mult = 2, camera_noise_reduction_method = "image"):
-        start_time = datetime.now()
+    def _get_average_images(self, images, camera_noise_reduction_method, average_closed_shutter_image):
         border_pixels = []
         first = True
         for image in images:
@@ -649,29 +645,13 @@ class ImageAnalysisProjection(ImageAnalysis):
             for col in range(average_filled_image.shape[1]):
                 average_closed_shutter_image[...,col] += np.median((average_filled_image - average_closed_shutter_image)[...,col])
 
-        # Subtract closed-shutter image to reduce pixel and row noise and clamp image at 0
+        # Subtract closed-shutter image to reduce pixel and row noise
         average_filled_image -= average_closed_shutter_image
-        #average_filled_image[average_filled_image < 0] = 0
 
-        if self.print_info:
-            print("Acquiring atom locations")
-        self._find_atom_locations(average_filled_image, site_detection_threshold, extend_locations_to_fov, closed_shutter_image_provided)
-        if self.print_info:
-            print("Atom_locations: " + str(self.atom_locations))
-            plt.imshow(average_filled_image)
-            plt.title("Average image with detected atom locations")
-            if len(self.atom_locations) < 1000:
-                for loc in self.atom_locations:
-                    plt.plot(loc[1], loc[0], marker='x', color="red") 
-            plot.show()
-            print("Acquiring PSF")
-        self._find_psf(images, average_closed_shutter_image, psf_distance_mult)
+        return average_filled_image, average_closed_shutter_image
+    
 
-        if self.print_info:
-            plt.imshow(self.psf)
-            plt.title("Full scale PSF")
-            plt.show()
-
+    def _generate_and_set_projectors_low_spacing(self, proj_shape):
         trafo_site_to_image = AffineTrafo2d()
         # Set site unit vectors within image coordinate system
         trafo_site_to_image.set_origin_axes(
@@ -722,15 +702,62 @@ class ImageAnalysisProjection(ImageAnalysis):
         # Create object in underlying C++ library and set projectors
         if self.print_info:
             print("Creating C++ object")
-        self.solver = neutral_atom_image_analysis_cpp.ImageAnalysisProjection(self.psf, self.atom_locations)
-        self.solver.setProjGen(proj_gen)
+        self.solver.setProjectors(proj_gen)
 
-        parameters = []
+
+    def _generate_and_set_projectors_high_spacing(self, proj_shape):
+        ipsf_gen = state_reconstruction.IntegratedPsfGenerator(
+            psf=self.psf, psf_supersample=self.psf_supersample
+        )
+        if proj_shape is None:
+            proj_shape = self.psf.shape
+        full_projectors_array = np.ndarray((self.psf_supersample, self.psf_supersample, proj_shape[0], proj_shape[1]))
+        for dx in range(self.psf_supersample):
+            for dy in range(self.psf_supersample):
+                embedding_size = 4 * np.array(self.psf.shape)
+                image_pos = np.array([np.array([dx, dy]) / self.psf_supersample])
+                # Get local PSFs
+                local_psfs = get_local_psfs(
+                    *image_pos.T, integrated_psf_generator=ipsf_gen
+                )
+                embedded_psfs = get_embedded_local_psfs(
+                    local_psfs, offset=-embedding_size//2,
+                    size=embedding_size, normalize=True
+                )
+                # Get projectors
+                embedded_projs = get_embedded_projectors(embedded_psfs)
+                center_proj = embedded_projs[0]
+
+                # Crop projectors
+                proj_cropped = crop_projector(center_proj, proj_shape)
+                full_projectors_array[dx,dy] = proj_cropped
+
+        if self.print_info:
+            if self.psf_supersample > 1:
+                print("Integrated projector(s):")
+                fig, ax = plt.subplots(self.psf_supersample, self.psf_supersample)
+                for i in range(self.psf_supersample):
+                    for j in range(self.psf_supersample):
+                        fig.colorbar(ax[i,j].imshow(full_projectors_array[i,j]), ax = ax[i,j])
+                fig.show()
+            else:
+                plt.imshow(full_projectors_array[0, 0])
+                plt.title("Integrated projector")
+                plt.colorbar()
+                plt.show()
+        self.solver.setProjectorsFromArray(full_projectors_array)
+
+
+    def _find_atom_site_groupings(self, images, min_cal_samples):
         self.threshold = [0] * len(self.atom_locations)
+        parameters = []
         atom_site_index_to_parameter_index = []
 
         # Group atom sites together spatially
-        if min_cal_samples is None or len(images) >= min_cal_samples:
+        if min_cal_samples is None:
+            parameters.append([])
+            atom_site_index_to_parameter_index = [0] * len(self.atom_locations)
+        elif len(images) >= min_cal_samples:
             for i in range(len(self.atom_locations)):
                 parameters.append([])
                 atom_site_index_to_parameter_index.append(i)
@@ -765,7 +792,6 @@ class ImageAnalysisProjection(ImageAnalysis):
                         else:
                             cols_in_group += 1
                             col_group_size = potential_new_col_size
-                print(str(rows_in_group) + "; " + str(cols_in_group))
                 if self.print_info:
                     print("Grouping atom sites together to get sufficient data points")
                     print("Rows in group: " + str(rows_in_group))
@@ -781,20 +807,31 @@ class ImageAnalysisProjection(ImageAnalysis):
                         for r in row_group:
                             for c in col_group:
                                 atom_site_index_to_parameter_index[r * self.sites_shape[1] + c] = parameter_index
+        return parameters, atom_site_index_to_parameter_index
 
-        # Reconstruct all test images to find best threshold
-        start_time_reconstruct = datetime.now()
-        for image in images:
-            if isinstance(image, DataFrame):
-                image_np = image.to_numpy(np.float64)
-            else:
-                image_np = np.array(image).astype(np.float64)
-            result = self._reconstruct(image_np)
-            for i in range(len(self.atom_locations)):
-                parameters[atom_site_index_to_parameter_index[i]].append(result[i])
-        if self.print_info:
-            print("All images reconstructed within " + str((datetime.now() - start_time_reconstruct).total_seconds() * 1e3) + "ms")
+    
+    def _generate_and_set_projectors(self, proj_shape):
+        if not hasattr(self, 'spacing') or self.spacing is None:
+            distances = distance.pdist(np.array(self.atom_locations))
+            min_spacing = int(min(distances))
+        else:
+            min_spacing = int(min(self.spacing))
+        if proj_shape is None:
+            print("Proj_shape set to min spacing " + str(min_spacing))
+            if(min_spacing % 2 == 0):
+                min_spacing += 1
+            proj_shape = (min_spacing, min_spacing)
+        if not hasattr(self, '_image_ref'):
+            self._image_ref = self.atom_locations[0]
 
+        if (proj_shape[0] > min_spacing or proj_shape[1] > min_spacing) \
+            and hasattr(self, 'spacing') and hasattr(self, 'angle'):
+            self._generate_and_set_projectors_low_spacing(proj_shape)
+        else:
+            self._generate_and_set_projectors_high_spacing(proj_shape)
+
+    
+    def _calibrate_threshold(self, parameters, atom_site_index_to_parameter_index):
         fidelities = []
         fidelities0 = []
         fidelities1 = []
@@ -864,21 +901,15 @@ class ImageAnalysisProjection(ImageAnalysis):
             second_peak = popt[3]
             sigma2 = popt[4]
 
-            # Use measured filling ratio or 0.5 if use_measured_loading_rate == False
-            if use_measured_loading_rate:
-                calibration_filling_ratio = filling_ratio
-            else:
-                calibration_filling_ratio = 0.5
-
             # Calculate threshold so that weighted pdf is equal, i.e. minimize total error for given filling ratio
             a = 1 / (2 * sigma2**2) - 1 / (2 * sigma1**2)
-            if a == 0 or sigma1 == 0 or sigma2 == 0 or calibration_filling_ratio == 0 or \
-                ((1 - calibration_filling_ratio) * sigma2) / (calibration_filling_ratio * sigma1) <= 0:
+            if a == 0 or sigma1 == 0 or sigma2 == 0 or filling_ratio == 0 or \
+                ((1 - filling_ratio) * sigma2) / (filling_ratio * sigma1) <= 0:
                 print("Division by zero. Setting threshold to middle between two peaks")
                 t = (first_peak + second_peak) / 2
             else:
                 b = first_peak / (sigma1**2) - second_peak / (sigma2**2)
-                c = (second_peak**2) / (2 * sigma2**2) - (first_peak**2) / (2 * sigma1**2) + math.log(((1 - calibration_filling_ratio) * sigma2) / (calibration_filling_ratio * sigma1))
+                c = (second_peak**2) / (2 * sigma2**2) - (first_peak**2) / (2 * sigma1**2) + math.log(((1 - filling_ratio) * sigma2) / (filling_ratio * sigma1))
                 d = b**2 - 4 * a * c
                 if d < 0:
                     print("No intersection between curves. Setting threshold to middle between two peaks")
@@ -895,6 +926,7 @@ class ImageAnalysisProjection(ImageAnalysis):
                 plt.plot(bin_centers_empty, count_empty)
                 plt.plot(bin_centers_occ, count_occ)
                 plt.plot(all_data_points, two_gaussians(all_data_points, first_peak, sigma1, filling_ratio, second_peak, sigma2))
+                plt.title("Emission values, fit, and threshold for trap (group) " + str(p_index))
                 plt.vlines([t], 0, count.max(), colors=['red'])
                 plt.legend(['Empty count', 'Occ count', 'Total fit', 'Detected threshold'])
                 plt.show()
@@ -907,15 +939,104 @@ class ImageAnalysisProjection(ImageAnalysis):
             fidelities0.append(fidelity0)
             fidelity1 = norm.sf(t, loc = second_peak, scale = sigma2)
             fidelities1.append(fidelity1)
-            fidelities.append((1 - calibration_filling_ratio) * fidelity0 + calibration_filling_ratio * fidelity1)
+            fidelities.append((1 - filling_ratio) * fidelity0 + filling_ratio * fidelity1)
+        return first_peak, second_peak, fidelities, fidelities0, fidelities1, filling_ratio
+    
 
+    def calibrate_from_known(self, images, atom_locations : list[tuple[float,float]], psf : np.array,
+                             average_closed_shutter_image = None, proj_shape : tuple[int,int] = None, 
+                             min_cal_samples = None, camera_noise_reduction_method = "image"):
+        start_time = datetime.now()
+        
+        _, self.average_closed_shutter_image = self._get_average_images(images, camera_noise_reduction_method, average_closed_shutter_image)
+        
+        self.atom_locations = atom_locations
+        self.psf = psf
+        self._image_ref = atom_locations[0]
+
+        self.solver = neutral_atom_image_analysis_cpp.ImageAnalysisProjection(self.psf, self.atom_locations)
+
+        self._generate_and_set_projectors(proj_shape)
+        
+        parameters, atom_site_index_to_parameter_index = self._find_atom_site_groupings(images, min_cal_samples)
+
+        # Reconstruct all test images to find best threshold
+        start_time_reconstruct = datetime.now()
+        for image in images:
+            if isinstance(image, DataFrame):
+                image_np = image.to_numpy(np.float64)
+            else:
+                image_np = np.array(image).astype(np.float64)
+            result = self._reconstruct(image_np)
+            for i in range(len(self.atom_locations)):
+                parameters[atom_site_index_to_parameter_index[i]].append(result[i])
+        if self.print_info:
+            print("All images reconstructed within " + str((datetime.now() - start_time_reconstruct).total_seconds() * 1e3) + "ms")
+
+        first_peak, second_peak, fidelities, fidelities0, fidelities1, filling_ratio = \
+            self._calibrate_threshold(parameters, atom_site_index_to_parameter_index)
         if self.print_info:
             print("F0 avg: " + str(np.average(fidelities0)))
             print("F1 avg: " + str(np.average(fidelities1)))
             print("F avg: " + str(np.average(fidelities)))
             print("Calibration finished, total time: " + str((datetime.now() - start_time).total_seconds() * 1e3) + "ms")
 
-        return self.threshold, [first_peak, second_peak], fidelities, fidelities0, fidelities1, calibration_filling_ratio, filling_ratio
+        return self.threshold, [first_peak, second_peak], fidelities, fidelities0, fidelities1, filling_ratio
+    
+
+    def calibrate(self, images, average_closed_shutter_image = None, proj_shape : tuple[int,int] = None, 
+        min_cal_samples = None, site_detection_threshold = 0.2, extend_locations_to_fov = False, 
+        psf_distance_mult = 2, camera_noise_reduction_method = "image", angle_guesses : tuple[int,int] = (90, 0)):
+        start_time = datetime.now()
+        
+        average_filled_image, self.average_closed_shutter_image = self._get_average_images(images, camera_noise_reduction_method, average_closed_shutter_image)
+        
+        self._find_atom_locations(average_filled_image, site_detection_threshold, extend_locations_to_fov, 
+                                  self.average_closed_shutter_image is not None, angle_guesses)
+        if self.print_info:
+            print("Atom_locations: " + str(self.atom_locations))
+            plt.imshow(average_filled_image)
+            plt.title("Average image with detected atom locations")
+            if len(self.atom_locations) < 1000:
+                for loc in self.atom_locations:
+                    plt.plot(loc[1], loc[0], marker='x', color="red") 
+            plot.show()
+            print("Acquiring PSF")
+
+        self._find_psf(images, self.average_closed_shutter_image, psf_distance_mult)
+        if self.print_info:
+            plt.imshow(self.psf)
+            plt.title("Full scale PSF")
+            plt.show()
+
+        self.solver = neutral_atom_image_analysis_cpp.ImageAnalysisProjection(self.psf, self.atom_locations)
+
+        self._generate_and_set_projectors(proj_shape)
+        
+        parameters, atom_site_index_to_parameter_index = self._find_atom_site_groupings(images, min_cal_samples)
+
+        # Reconstruct all test images to find best threshold
+        start_time_reconstruct = datetime.now()
+        for image in images:
+            if isinstance(image, DataFrame):
+                image_np = image.to_numpy(np.float64)
+            else:
+                image_np = np.array(image).astype(np.float64)
+            result = self._reconstruct(image_np)
+            for i in range(len(self.atom_locations)):
+                parameters[atom_site_index_to_parameter_index[i]].append(result[i])
+        if self.print_info:
+            print("All images reconstructed within " + str((datetime.now() - start_time_reconstruct).total_seconds() * 1e3) + "ms")
+
+        first_peak, second_peak, fidelities, fidelities0, fidelities1, filling_ratio = \
+            self._calibrate_threshold(parameters, atom_site_index_to_parameter_index)
+        if self.print_info:
+            print("F0 avg: " + str(np.average(fidelities0)))
+            print("F1 avg: " + str(np.average(fidelities1)))
+            print("F avg: " + str(np.average(fidelities)))
+            print("Calibration finished, total time: " + str((datetime.now() - start_time).total_seconds() * 1e3) + "ms")
+
+        return self.threshold, [first_peak, second_peak], fidelities, fidelities0, fidelities1, filling_ratio
 
     def _reconstruct(self, image):
         # Preprocess image
@@ -925,7 +1046,7 @@ class ImageAnalysisProjection(ImageAnalysis):
             image_np = np.array(image).astype(np.float64)
         if np.isfortran(image_np):
             image_np = np.ascontiguousarray(image_np)
-        
+        image_np -= self.average_closed_shutter_image
         parameters = self.solver.reconstruct(image_np)
         return parameters
 
