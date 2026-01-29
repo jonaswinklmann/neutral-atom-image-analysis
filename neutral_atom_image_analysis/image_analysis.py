@@ -811,11 +811,7 @@ class ImageAnalysisProjection(ImageAnalysis):
 
     
     def _generate_and_set_projectors(self, proj_shape):
-        if not hasattr(self, 'spacing') or self.spacing is None:
-            distances = distance.pdist(np.array(self.atom_locations))
-            min_spacing = int(min(distances))
-        else:
-            min_spacing = int(min(self.spacing))
+        min_spacing = int(min(self.spacing))
         if proj_shape is None:
             print("Proj_shape set to min spacing " + str(min_spacing))
             if(min_spacing % 2 == 0):
@@ -943,15 +939,48 @@ class ImageAnalysisProjection(ImageAnalysis):
         return first_peak, second_peak, fidelities, fidelities0, fidelities1, filling_ratio
     
 
-    def calibrate_from_known(self, images, atom_locations : list[tuple[float,float]], psf : np.array,
+    def calibrate_from_known(self, images, atom_locations : list[tuple[float,float]], psf = None,
                              average_closed_shutter_image = None, proj_shape : tuple[int,int] = None, 
-                             min_cal_samples = None, camera_noise_reduction_method = "image"):
+                             min_cal_samples = None, psf_distance_mult = 2, camera_noise_reduction_method = "image"):
         start_time = datetime.now()
         
         _, self.average_closed_shutter_image = self._get_average_images(images, camera_noise_reduction_method, average_closed_shutter_image)
         
         self.atom_locations = atom_locations
-        self.psf = psf
+
+        if not hasattr(self, 'spacing') or self.spacing is None:
+            min_dist = np.linalg.norm(np.array(self.atom_locations[0]) - np.array(self.atom_locations[1]))
+            min_other_dist = 0
+            ref_vector = np.array(self.atom_locations[0]) - np.array(self.atom_locations[1])
+            for i in range(len(self.atom_locations)):
+                for j in range(i + 1, len(self.atom_locations)):
+                    vec = np.array(self.atom_locations[i]) - np.array(self.atom_locations[j])
+                    dist = np.linalg.norm(vec)
+                    if dist < min_dist:
+                        ref_vector = vec / dist
+                        min_dist = dist
+                    if dist > min_other_dist:
+                        min_other_dist = dist
+
+            one_over_sqrt2 = 1 / np.sqrt(2)
+            for i in range(len(self.atom_locations)):
+                for j in range(i + 1, len(self.atom_locations)):
+                    vec = np.array(self.atom_locations[i]) - np.array(self.atom_locations[j])
+                    dist = np.linalg.norm(vec)
+                    vec /= dist
+                    if dist < min_other_dist and np.abs(np.dot(ref_vector, vec)) < one_over_sqrt2:
+                        min_other_dist = dist
+            self.spacing = (min_dist, min_other_dist)
+
+        if psf is not None and isinstance(psf, np.array):
+            self.psf = psf
+        else:
+            self._find_psf(images, self.average_closed_shutter_image, psf_distance_mult)
+            if self.print_info:
+                plt.imshow(self.psf)
+                plt.title("Full scale PSF")
+                plt.show()
+
         self._image_ref = atom_locations[0]
 
         self.solver = neutral_atom_image_analysis_cpp.ImageAnalysisProjection(self.psf, self.atom_locations)
