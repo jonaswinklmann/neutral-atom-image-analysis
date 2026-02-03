@@ -1,0 +1,7 @@
+numpy
+libics
+pandas
+state_reconstruction
+skimage
+scipy
+sphinx_rtd_theme

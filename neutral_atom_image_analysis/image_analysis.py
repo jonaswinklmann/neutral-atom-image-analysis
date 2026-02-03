@@ -29,20 +29,7 @@ from scipy.spatial import Voronoi, voronoi_plot_2d, distance
 import numpy as np
 import abc
 
-def three_gaussian_peaks(x, loc, scale, o_scale1, o_scale2, o_scale3, offset, slope):
-    return offset + slope * x + norm.pdf(x, loc = loc, scale = scale) * o_scale1 + \
-        norm.pdf(x, loc = loc * 2, scale = scale) * o_scale2 + \
-        norm.pdf(x, loc = loc * 3, scale = scale) * o_scale3
-
-def two_gaussians(x, loc1, scale1, f, loc2, scale2):
-    return norm.pdf(x, loc = loc1, scale = scale1) * (1 - f) + \
-        norm.pdf(x, loc = loc2, scale = scale2) * f
-
-def gaussian_peak_empty(x, loc1, scale1, f):
-    return norm.pdf(x, loc = loc1, scale = scale1) * (1 - f)
-
-def single_sloped_gaussian_peak(x, loc, scale, o_scale1, offset, slope):
-    return offset + slope * x + norm.pdf(x, loc = loc, scale = scale) * o_scale1
+gaussian_peak_default = 0.3989422804
 
 class ImageAnalysis(abc.ABC):
     def __init__(self):
@@ -62,6 +49,27 @@ class ImageAnalysisProjection(ImageAnalysis):
         ImageAnalysis.__init__(self)
         self.psf_supersample = psf_supersample
         self.print_info = print_info
+
+    def __three_gaussian_peaks(self, x, loc, scale, o_scale1, o_scale2, o_scale3, offset, slope):
+        return offset + slope * x + norm.pdf(x, loc = loc, scale = scale) * o_scale1 + \
+            norm.pdf(x, loc = loc * 2, scale = scale) * o_scale2 + \
+            norm.pdf(x, loc = loc * 3, scale = scale) * o_scale3
+
+    def __two_gaussians(self, x, loc1, scale1, f, loc2, scale2):
+        return norm.pdf(x, loc = loc1, scale = scale1) * (1 - f) + \
+            norm.pdf(x, loc = loc2, scale = scale2) * f
+
+    def __gaussian_peak_empty(self, x, loc1, scale1, f):
+        return norm.pdf(x, loc = loc1, scale = scale1) * (1 - f)
+
+    def __single_sloped_gaussian_peak(self, x, loc, scale, o_scale1, offset, slope):
+        return offset + slope * x + norm.pdf(x, loc = loc, scale = scale) * o_scale1
+
+    def __gaussian_2d(self, x, loc_x, loc_y, scale_x, scale_y, offset, mult):
+        return np.array(norm.pdf(x[0], loc = loc_y, scale = scale_y) * norm.pdf(x[1], loc = loc_x, scale = scale_x) * mult + offset).ravel()
+
+    def __gaussian_wrapped(self, x, loc, scale, mult):
+        return norm.pdf(x, loc=loc, scale=scale) * mult
 
     def _find_best_projection_angle(self, image, center_angle, angle_radius, angle_steps, closed_shutter_image_provided):
         tested_angles = np.linspace(center_angle - angle_radius, center_angle + angle_radius, angle_steps)
@@ -88,7 +96,8 @@ class ImageAnalysisProjection(ImageAnalysis):
         return tested_angles[highest_var_index], h[...,highest_var_index].flatten()
 
     def _find_atom_locations(self, average_image, site_detection_threshold, extend_locations_to_fov, 
-                             closed_shutter_image_provided, target_axes):
+                             closed_shutter_image_provided, target_axes, optimize_locations_individually,
+                             remove_sites_under_fit_height_percentile):
         origins_first_peak_axes = []
         dirs_first_peak_axes = []
 
@@ -149,14 +158,14 @@ class ImageAnalysisProjection(ImageAnalysis):
             slope = (autocorrelation[start_index + index] - autocorrelation[start_index]) / index
             popt = None
             try:
-                popt, _ = curve_fit(three_gaussian_peaks, x_range, autocorrelation[start_index:end_index], 
+                popt, _ = curve_fit(self.__three_gaussian_peaks, x_range, autocorrelation[start_index:end_index], 
                     p0=[index, peak_width_guess, peak_factor_guess, peak_factor_guess, peak_factor_guess, autocorrelation[start_index], slope],
                     bounds=([0, 0, 0, 0, 0, np.min(autocorrelation[start_index:end_index]), -np.inf], 
                             [np.inf, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf]))
             except (RuntimeError, OptimizeWarning):
                 if popt is None:
                     try:
-                        popt, _ = curve_fit(single_sloped_gaussian_peak, x_range, autocorrelation[start_index:end_index], 
+                        popt, _ = curve_fit(self.__single_sloped_gaussian_peak, x_range, autocorrelation[start_index:end_index], 
                             p0=[index, peak_width_guess, peak_factor_guess, autocorrelation[start_index], slope],
                             bounds=([0, 0, 0, np.min(autocorrelation[start_index:end_index]), -np.inf], 
                                     [np.inf, np.inf, np.inf, np.inf, np.inf]))
@@ -217,7 +226,7 @@ class ImageAnalysisProjection(ImageAnalysis):
             # To get a more precise subpixel location, find the offset for which the difference 
             # between projection and the given number of gaussian peaks is minimal
             peak_height = 1 / norm.pdf([0],0,peak_width)[0] / (2 * neighbor_dist + 1)
-            def gaussian(x, loc_offset, scale, factor):
+            def gaussian_series(x, loc_offset, scale, factor):
                 result = 0
                 for index, value in zip(indices, values):
                     result += norm.pdf(x, loc = index + loc_offset, scale = scale) * value * factor
@@ -225,7 +234,7 @@ class ImageAnalysisProjection(ImageAnalysis):
 
             x_range = [i for i in range(len(projection)) if projection[i] >= 0]
             try:
-                popt, _ = curve_fit(gaussian, x_range, projection[x_range], p0 = [0,peak_width,peak_height])
+                popt, _ = curve_fit(gaussian_series, x_range, projection[x_range], p0 = [0,peak_width,peak_height])
                 for i in range(len(indices)):
                     indices[i] += popt[0]
             except (RuntimeError, ValueError, OptimizeWarning):
@@ -233,7 +242,7 @@ class ImageAnalysisProjection(ImageAnalysis):
             
             if self.print_info:
                 plt.plot(x_range, projection[x_range])
-                plt.plot(x_range, gaussian(x_range,*popt))
+                plt.plot(x_range, gaussian_series(x_range,*popt))
                 plt.title("Fitting multiple gaussian peaks to emission projection")
                 plt.legend(["Proj", "Fit"])
                 plt.show()
@@ -287,6 +296,60 @@ class ImageAnalysisProjection(ImageAnalysis):
                     location = self._image_ref + r * self.spacing[0] * proj_vectors[0] + c * self.spacing[1] * proj_vectors[1]
                     if min(location) >= 0 and location[0] < average_image.shape[0] and location[1] < average_image.shape[1]:
                         self.atom_locations.append(location)
+        
+        if optimize_locations_individually:
+            all_mults = []
+            for i in range(len(self.atom_locations)):
+                x, y = self.atom_locations[i]
+                y_start = int(y - self.spacing[0] / 2)
+                y_max = int(self.spacing[0])
+                if y_start < 0:
+                    y_start = 0
+                if y_start + y_max > average_image.shape[0]:
+                    y_max = average_image.shape[0] - y_start
+                x_start = int(x - self.spacing[1] / 2)
+                x_max = int(self.spacing[1])
+                if x_start < 0:
+                    x_start = 0
+                if x_start + x_max > average_image.shape[1]:
+                    x_max = average_image.shape[1] - x_start
+                x_data = np.mgrid[0:x_max, 0:y_max]
+                y_data = np.array(average_image[x_start:x_start + x_max, y_start:y_start + y_max])
+                max_index = np.unravel_index(y_data.argmax(), y_data.shape)
+                init_guesses = [max_index[1], max_index[0], 5, 5, y_data.min(),\
+                                (y_data.max() - y_data.min()) * gaussian_peak_default * gaussian_peak_default * 25]
+                all_bounds = ([0,0,0,0,-np.inf,0],[y_max,x_max,np.inf,np.inf,np.inf,np.inf])
+                try:
+                    popt, _ = curve_fit(self.__gaussian_2d, x_data, y_data.ravel(), p0=init_guesses, bounds=all_bounds)
+                except: 
+                    all_mults.append(0)
+                    continue
+                all_mults.append(popt[5])
+                self.atom_locations[i] = np.array((x_start + popt[1], y_start + popt[0]))
+
+        if remove_sites_under_fit_height_percentile is not None:
+            bin_count = int(math.sqrt(len(self.atom_locations)))
+            if bin_count < 10:
+                bin_count = 10
+            hist, bin_edges = np.histogram(all_mults, bin_count)
+            x_data = (np.array(bin_edges[:-1]) + np.array(bin_edges[1:])) / 2
+            hist = hist.astype(float) / len(all_mults)
+            stddev_guess = np.std(all_mults)
+            try:
+                popt, _ = curve_fit(self.__gaussian_wrapped, x_data, hist, p0=[x_data[int(len(x_data) * 0.75)],stddev_guess,bin_edges[1]-bin_edges[0]])
+            except:
+                if self.print_info:
+                    print("Curve fit for site removal not successful")
+            else:
+                new_atom_locations = []
+                site_removal_threshold = norm.ppf(remove_sites_under_fit_height_percentile, loc=popt[0], scale=popt[1])
+                if self.print_info:
+                    print("Removing atom site where chance of peak height is below " + str(remove_sites_under_fit_height_percentile) + " if atoms were present")
+                for i, mult in enumerate(all_mults):
+                    if mult >= site_removal_threshold:
+                        new_atom_locations.append(self.atom_locations[i])
+                self.atom_locations = new_atom_locations
+
     
     def _get_potentially_occ_atom_locations_within_radius(self, center, atom_location_occ_groups, radius):
         ret_locations = []
@@ -440,8 +503,6 @@ class ImageAnalysisProjection(ImageAnalysis):
         peaks, properties = find_peaks(count, prominence=0.01)
 
         # Height of peak gives good estimate for scale
-        gaussian_peak_default = 0.3989422804
-
         popt = None
         peak_index_in_peaks = np.argmax(properties['prominences'])
         first_peak_index = peaks[peak_index_in_peaks]
@@ -451,14 +512,15 @@ class ImageAnalysisProjection(ImageAnalysis):
             second_peak_index = peaks[peak_index_in_peaks]
 
             try:
-                popt, _ = curve_fit(two_gaussians, bin_centers, count, p0 = (bin_centers[first_peak_index], gaussian_peak_default / count[first_peak_index], 0.5, \
+                popt, _ = curve_fit(self.__two_gaussians, bin_centers, count, p0 = (bin_centers[first_peak_index], gaussian_peak_default / count[first_peak_index], 0.5, \
                     bin_centers[second_peak_index], gaussian_peak_default / count[second_peak_index]))
                 # Take all sites where chance of being empty is below threshold
                 pdf_empty = norm.pdf(bin_centers, loc=popt[0], scale=popt[1]) * (1 - popt[2])
                 pdf_occ = norm.pdf(bin_centers, loc=popt[3], scale=popt[4]) * popt[2]
                 empty_threshold = -1
                 threshold = -1
-                max_occ_to_empty_prob = np.max(pdf_occ / pdf_empty)
+                mask = pdf_empty > 0
+                max_occ_to_empty_prob = np.max(pdf_occ[mask] / pdf_empty[mask])
                 if max_occ_to_empty_prob > 1:
                     for i in range(first_peak_index, len(count)):
                         if pdf_occ[i] > pdf_empty[i]:
@@ -482,7 +544,7 @@ class ImageAnalysisProjection(ImageAnalysis):
                     empty_threshold = bin_centers[first_peak_index]
         else:
             try:
-                popt, _ = curve_fit(gaussian_peak_empty, bin_centers, count, p0 = (bin_centers[first_peak_index], gaussian_peak_default / count[first_peak_index], 0.5))
+                popt, _ = curve_fit(self.__gaussian_peak_empty, bin_centers, count, p0 = (bin_centers[first_peak_index], gaussian_peak_default / count[first_peak_index], 0.5))
                 # Take all sites where chance of being empty is below threshold
                 threshold = norm.isf(1e-3 / (1 - popt[2]), popt[0], popt[1])
                 empty_threshold = norm.isf(0.1 / (1 - popt[2]), popt[0], popt[0])
@@ -532,7 +594,7 @@ class ImageAnalysisProjection(ImageAnalysis):
                 distance_array_size = initial_distance_array_size / ((x_divs * y_divs) ** 2)
             overlap_dist = psf_radius * (1 + psf_distance_mult)
             complete_voronoi = np.full_like(image_np, -1)
-            if self.print_info and (y_divs > 1 or x_divs > 1):
+            if self.print_info and (y_divs > 1 or x_divs > 1) and image_index == 0:
                 print(f"Subdividing image into {y_divs} x {x_divs} patches to not run out of memory")
             for y_div in range(y_divs):
                 y_start = int(y_div * image_np.shape[0] / y_divs)
@@ -749,7 +811,6 @@ class ImageAnalysisProjection(ImageAnalysis):
 
 
     def _find_atom_site_groupings(self, images, min_cal_samples):
-        self.threshold = [0] * len(self.atom_locations)
         parameters = []
         atom_site_index_to_parameter_index = []
 
@@ -828,6 +889,8 @@ class ImageAnalysisProjection(ImageAnalysis):
 
     
     def _calibrate_threshold(self, parameters, atom_site_index_to_parameter_index):
+        self.threshold = [0] * len(self.atom_locations)
+
         fidelities = []
         fidelities0 = []
         fidelities1 = []
@@ -877,7 +940,7 @@ class ImageAnalysisProjection(ImageAnalysis):
             popt_guesses = [bin_centers_empty[first_peak_index], gaussian_peak_default / count_empty[first_peak_index],\
                 0.5, bin_centers_occ[second_peak_index], gaussian_peak_default / count_occ[second_peak_index]]
             try:
-                popt, _ = curve_fit(two_gaussians, all_x, all_y, p0 = popt_guesses, \
+                popt, _ = curve_fit(self.__two_gaussians, all_x, all_y, p0 = popt_guesses, \
                     bounds=([bin_centers_empty[0], 0, 0, bin_centers_empty[0], 0],\
                             [rough_treshold, np.inf, 1, bin_centers_occ[-1], np.inf]))
             except ValueError:
@@ -921,7 +984,7 @@ class ImageAnalysisProjection(ImageAnalysis):
             if self.print_info:
                 plt.plot(bin_centers_empty, count_empty)
                 plt.plot(bin_centers_occ, count_occ)
-                plt.plot(all_data_points, two_gaussians(all_data_points, first_peak, sigma1, filling_ratio, second_peak, sigma2))
+                plt.plot(all_data_points, self.__two_gaussians(all_data_points, first_peak, sigma1, filling_ratio, second_peak, sigma2))
                 plt.title("Emission values, fit, and threshold for trap (group) " + str(p_index))
                 plt.vlines([t], 0, count.max(), colors=['red'])
                 plt.legend(['Empty count', 'Occ count', 'Total fit', 'Detected threshold'])
@@ -942,6 +1005,30 @@ class ImageAnalysisProjection(ImageAnalysis):
     def calibrate_from_known(self, images, atom_locations : list[tuple[float,float]], psf = None,
                              average_closed_shutter_image = None, proj_shape : tuple[int,int] = None, 
                              min_cal_samples = None, psf_distance_mult = 2, camera_noise_reduction_method = "image"):
+        """Function to calibrate the image analysis from known list of atom locations
+
+        :param images: The images to be used for calibration. Should be iterable with each element being either a DataFrame or convertible to a numpy array
+        :type images: list
+        :param psf: The point-spread function if it is already known. Will be calibrated if None, defaults to None
+        :type psf: numpy.array[float], optional
+        :param average_closed_shutter_image: Average image without atoms or with closed shutter. Used to reduce camera noise if camera_noise_reduction_method = "image", defaults to None
+        :type average_closed_shutter_image: numpy.array[float], optional
+        :param proj_shape: Size of projection kernel. Will be set automatically based on atom spacing if not provided, defaults to None
+        :type proj_shape: tuple[int,int], optional
+        :param min_cal_samples: Number of samples to calibrate detection threshold. If min_cal_samples > len(images), \
+            spatially close sites are grouped together for threshold calibration. Groups all sites together if None. Set to 0 if grouping is never desired, defaults to None
+        :type min_cal_samples: int, optional
+        :param psf_distance_mult: To consider a pixel for PSF calibration, the second-nearest atom must be at least psf_distance_mult times as distant as the nearest. \
+            Bigger values reduce noise at PSf edge but reduce maximum meaningful PSF size, defaults to 2
+        :type psf_distance_mult: float, optional
+        :param camera_noise_reduction_method: Method of reducing camera noise, "border" to use median pixel value of images at the edges, "rowcol" to use median value of images per row and column, \
+            "image" to use provided average_closed_shutter_image. If "image" and not average_closed_shutter_image provided, "rowcol" is used, defaults to "image"
+        :type camera_noise_reduction_method: string, optional
+        :raises AttributeError: Combination of attributes is not meaningful
+        :return: List of detection threshold per site, [Empty-peak emission value, Occupied-peak emission value], Fidelity per atom site, 
+            Fidelity0 (Fraction of empty sites detected as such) per atom site, Fidelity1 (Fraction of occupied sites detected as such) per atom site, Filling ratio
+        :rtype: list[float], [float, float], list[float], list[float], list[float], float
+        """
         start_time = datetime.now()
         
         _, self.average_closed_shutter_image = self._get_average_images(images, camera_noise_reduction_method, average_closed_shutter_image)
@@ -1015,13 +1102,49 @@ class ImageAnalysisProjection(ImageAnalysis):
 
     def calibrate(self, images, average_closed_shutter_image = None, proj_shape : tuple[int,int] = None, 
         min_cal_samples = None, site_detection_threshold = 0.2, extend_locations_to_fov = False, 
-        psf_distance_mult = 2, camera_noise_reduction_method = "image", angle_guesses : tuple[int,int] = (90, 0)):
+        psf_distance_mult = 2, camera_noise_reduction_method = "image", angle_guesses : tuple[int,int] = (90, 0),
+        optimize_locations_individually = False, remove_sites_under_fit_height_percentile = None):
+        """Function to calibrate the image analysis
+
+        :param images: The images to be used for calibration. Should be iterable with each element being either a DataFrame or convertible to a numpy array
+        :type images: list
+        :param average_closed_shutter_image: Average image without atoms or with closed shutter. Used to reduce camera noise if camera_noise_reduction_method = "image", defaults to None
+        :type average_closed_shutter_image: numpy.array[float], optional
+        :param proj_shape: Size of projection kernel. Will be set automatically based on atom spacing if not provided, defaults to None
+        :type proj_shape: tuple[int,int], optional
+        :param min_cal_samples: Number of samples to calibrate detection threshold. If min_cal_samples > len(images), \
+            spatially close sites are grouped together for threshold calibration. Groups all sites together if None. Set to 0 if grouping is never desired, defaults to None
+        :type min_cal_samples: int, optional
+        :param site_detection_threshold: Fraction of maximum projection peak height to assume traps, defaults to 0.2
+        :type site_detection_threshold: int, optional
+        :param extend_locations_to_fov: If set to True, extend atom location grid in all directions within image coordinates, defaults to False
+        :type extend_locations_to_fov: bool, optional
+        :param psf_distance_mult: To consider a pixel for PSF calibration, the second-nearest atom must be at least psf_distance_mult times as distant as the nearest. \
+            Bigger values reduce noise at PSf edge but reduce maximum meaningful PSF size, defaults to 2
+        :type psf_distance_mult: float, optional
+        :param camera_noise_reduction_method: Method of reducing camera noise, "border" to use median pixel value of images at the edges, "rowcol" to use median value of images per row and column, \
+            "image" to use provided average_closed_shutter_image. If "image" and not average_closed_shutter_image provided, "rowcol" is used, defaults to "image"
+        :type camera_noise_reduction_method: string, optional
+        :param angle_guesses: Approximate angle of the two grid axes with respect to image axis, defaults to (90,0)
+        :type angle_guesses: tuple[int,int], optional
+        :param optimize_locations_individually: Whether to move each trap location individually to maximize alignment with local brightness peak. Otherwise only alignment with grid, default to False
+        :type optimize_locations_individually: bool, optional
+        :param remove_sites_under_fit_height_percentile: Remove trap locations from the grid where the detected brightness peak is very low. \
+            All sites are removed where the peak height is below the percentile point function of remove_sites_under_fit_height_percentile and the fitted peak-height-parameters across all sites.\
+            Does not remove any sites if None, default to None
+        :type remove_sites_under_fit_height_percentile: float, optional
+        :raises AttributeError: Combination of attributes is not meaningful
+        :return: List of detection threshold per site, [Empty-peak emission value, Occupied-peak emission value], Fidelity per atom site, 
+            Fidelity0 (Fraction of empty sites detected as such) per atom site, Fidelity1 (Fraction of occupied sites detected as such) per atom site, Filling ratio
+        :rtype: list[float], [float, float], list[float], list[float], list[float], float
+        """
         start_time = datetime.now()
         
         average_filled_image, self.average_closed_shutter_image = self._get_average_images(images, camera_noise_reduction_method, average_closed_shutter_image)
         
         self._find_atom_locations(average_filled_image, site_detection_threshold, extend_locations_to_fov, 
-                                  self.average_closed_shutter_image is not None, angle_guesses)
+                                  self.average_closed_shutter_image is not None, angle_guesses, optimize_locations_individually,\
+                                  remove_sites_under_fit_height_percentile)
         if self.print_info:
             print("Atom_locations: " + str(self.atom_locations))
             plt.imshow(average_filled_image)
