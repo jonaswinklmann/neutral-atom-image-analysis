@@ -27,3 +27,6 @@ pip install .
 ```
 
 The script ```compileCppAndInstallPip.sh``` combines building of the C++ library and pip installation.
+
+## Documentation
+A documentation of the provided classes and methods can be found [here](https://neutral-atom-image-analysis.readthedocs.io/en/latest/neutral_atom_image_analysis.html)
