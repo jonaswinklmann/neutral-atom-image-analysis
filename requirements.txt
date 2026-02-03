@@ -1,7 +1,10 @@
 numpy
-libics
 pandas
-state_reconstruction
 skimage
 scipy
+matplotlib
+Pillow
+xxhash
+colorama
+colorspacious
 sphinx_rtd_theme

@@ -13,6 +13,13 @@ build:
     # nodejs: "20"
     # rust: "1.70"
     # golang: "1.20"
+=======
+  jobs:
+    pre_install:
+      - git clone https://www.github.com/david-wei/libics.git
+      - pip install ./libics
+      - git clone https://www.github.com/david-wei/state_reconstruction.git
+      - pip install ./state_reconstruction
 
 # Build documentation in the "docs/" directory with Sphinx
 sphinx:
