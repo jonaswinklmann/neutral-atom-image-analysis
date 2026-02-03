@@ -42,4 +42,4 @@ python:
  install:
    - requirements: requirements.txt
    - method: pip
-     path: neutral_atom_image_analysis
+     path: ./
