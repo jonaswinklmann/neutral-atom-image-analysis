@@ -19,6 +19,8 @@ build:
       - pip install ./libics
       - git clone https://www.github.com/david-wei/state_reconstruction.git
       - pip install ./state_reconstruction
+      - git submodule update --init --recursive
+      - make module -C neutral_atom_image_analysis_cpp/
 
 # Build documentation in the "docs/" directory with Sphinx
 sphinx:

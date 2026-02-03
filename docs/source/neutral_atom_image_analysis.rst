@@ -20,6 +20,14 @@ neutral\_atom\_image\_analysis.image\_analysis module
    :undoc-members:
    :show-inheritance:
 
+neutral\_atom\_image\_analysis.neutral\_atom\_image\_analysis\_cpp module
+-------------------------------------------------------------------------
+
+.. automodule:: neutral_atom_image_analysis.neutral_atom_image_analysis_cpp
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 neutral\_atom\_image\_analysis.version module
 ---------------------------------------------
 
