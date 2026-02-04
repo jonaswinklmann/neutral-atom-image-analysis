@@ -2,6 +2,7 @@
 #include <pybind11/stl.h>
 
 #include "imageAnalysisProjection.hpp"
+#include "voronoiGenerator.hpp"
 
 namespace py = pybind11;
 
@@ -14,4 +15,10 @@ PYBIND11_MODULE(neutral_atom_image_analysis_cpp, m) {
         .def("reconstruct", &ImageAnalysisProjection::reconstruct, py::arg("image"))
         .def("setProjectors", &ImageAnalysisProjection::setProjectors, py::arg("prjgen"))
         .def("setProjectorsFromArray", &ImageAnalysisProjection::setProjectorsFromArray, py::arg("projectors"));
+    
+    py::class_<VoronoiGenerator>(m, "VoronoiGenerator")
+        .def(py::init<>())
+        .def("generate", &VoronoiGenerator::generate, py::arg("image"), py::arg("voronoi"), 
+            py::arg("atomLocations"), py::arg("potentialAtomLocations"), py::arg("psfDistanceMult"), 
+            py::arg("rowPadding"), py::arg("colPadding"));
 }

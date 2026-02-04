@@ -554,6 +554,8 @@ class ImageAnalysisProjection(ImageAnalysis):
                     threshold = (bin_centers[first_peak_index] + len(count)) / 2
                     empty_threshold = bin_centers[first_peak_index]
 
+        voronoi_generator_cpp = neutral_atom_image_analysis_cpp.VoronoiGenerator()
+
         for image_index,image in enumerate(images):
             if isinstance(image, DataFrame):
                 image_np = image.to_numpy(np.float64)
@@ -576,57 +578,11 @@ class ImageAnalysisProjection(ImageAnalysis):
 
             padding = np.array(((psf_radius,psf_radius),(psf_radius,psf_radius)))
             image_np = np.pad(image_np, padding, mode='constant')
-            
-            if len(potentially_occupied_atom_locations) == 0:
-                all_potentially_occupied_atom_locations = np.array(occupied_atom_locations)
-            else:
-                all_potentially_occupied_atom_locations = np.concatenate([occupied_atom_locations, potentially_occupied_atom_locations])
-            
-            initial_distance_array_size = len(all_potentially_occupied_atom_locations) * image_np.shape[0] * image_np.shape[1]
-            distance_array_size = initial_distance_array_size
-            x_divs = 1
-            y_divs = 1
-            while distance_array_size > 1e7:
-                if image_np.shape[0] / y_divs > image_np.shape[1] / x_divs:
-                    y_divs += 1
-                else:
-                    x_divs += 1
-                distance_array_size = initial_distance_array_size / ((x_divs * y_divs) ** 2)
-            overlap_dist = psf_radius * (1 + psf_distance_mult)
             complete_voronoi = np.full_like(image_np, -1)
-            if self.print_info and (y_divs > 1 or x_divs > 1) and image_index == 0:
-                print(f"Subdividing image into {y_divs} x {x_divs} patches to not run out of memory")
-            for y_div in range(y_divs):
-                y_start = int(y_div * image_np.shape[0] / y_divs)
-                y_end = int((y_div + 1) * image_np.shape[0] / y_divs)
-                for x_div in range(x_divs):
-                    x_start = int(x_div * image_np.shape[1] / x_divs)
-                    x_end = int((x_div + 1) * image_np.shape[1] / x_divs)
-                    start_index = np.array([y_start,x_start])
-                    end_index = np.array([y_end,x_end])
-                    start_location = start_index - padding[:,0]
-                    end_location = end_index - padding[:,0]
-                    all_local_sites, all_local_site_index_to_all_potential_index = self._get_atom_sites_in_subshape(\
-                        all_potentially_occupied_atom_locations, len(occupied_atom_locations), start_location, end_location, overlap_dist)
-                    all_local_sites = np.array(all_local_sites)
 
-                    padded_shape_start = start_location - overlap_dist
-                    padded_shape_end = end_location + overlap_dist
-                    x,y = np.meshgrid(np.arange(padded_shape_end[1] - padded_shape_start[1]) + padded_shape_start[1], \
-                                      np.arange(padded_shape_end[0] - padded_shape_start[0]) + padded_shape_start[0])
-                    dist = np.sqrt((y[:, :, np.newaxis] - all_local_sites[:,0][np.newaxis, np.newaxis]) ** 2 + \
-                        (x[:, :, np.newaxis] - all_local_sites[:,1][np.newaxis, np.newaxis]) ** 2)
-                    max_val = np.max(dist)
-                    closest_val = np.min(dist, axis=2)
-                    voronoi = np.argmin(dist, axis=2, keepdims=True)
-                    np.put_along_axis(dist, voronoi, max_val, axis=2)
-                    second_closest_val = np.min(dist, axis=2)
-                    voronoi = np.squeeze(voronoi)
-                    voronoi = np.array([[all_local_site_index_to_all_potential_index[i] for i in row] for row in voronoi])
-                    border_mask = second_closest_val < psf_distance_mult * closest_val
-                    voronoi[border_mask] = -1
-                    complete_voronoi[start_index[0]:end_index[0],start_index[1]:end_index[1]] = voronoi[overlap_dist:-overlap_dist,overlap_dist:-overlap_dist]
-            
+            voronoi_generator_cpp.generate(image_np, complete_voronoi, occupied_atom_locations, \
+                                           potentially_occupied_atom_locations, psf_distance_mult, padding[0][0], padding[0][1])
+
             mask = np.ones_like(self.psf, bool)
             for i, atom_location in enumerate(occupied_atom_locations):
                 y_padding = 0
@@ -895,9 +851,13 @@ class ImageAnalysisProjection(ImageAnalysis):
         fidelities0 = []
         fidelities1 = []
 
+        average_filling_ratio = 0
+        first_peaks = []
+        second_peaks = []
+
         for p_index, parameters_individual in enumerate(parameters):
             # Prepare histogram for threshold detection
-            count, bin_edges = np.histogram(parameters_individual, bins=int(np.sqrt(len(parameters_individual))))
+            count, bin_edges = np.histogram(parameters_individual, bins=2 * int(np.sqrt(len(parameters_individual))))
             bin_size = bin_edges[1] - bin_edges[0]
             count = np.array(count).astype(np.float64) / len(parameters_individual) / bin_size
             bin_centers = (np.array(bin_edges[:-1]) + np.array(bin_edges[1:])) / 2
@@ -933,14 +893,13 @@ class ImageAnalysisProjection(ImageAnalysis):
             second_peak_index = peaks[peak_index_in_peaks]
 
             # Fit gaussian to acquire distributions
-            gaussian_peak_default = 0.3989422804
+            gaussian_peak_default = 0.39894228047
+
             popt = None
-            all_x = np.concatenate([bin_centers_empty,bin_centers_occ])
-            all_y = np.concatenate([count_empty,count_occ])
             popt_guesses = [bin_centers_empty[first_peak_index], gaussian_peak_default / count_empty[first_peak_index],\
                 0.5, bin_centers_occ[second_peak_index], gaussian_peak_default / count_occ[second_peak_index]]
             try:
-                popt, _ = curve_fit(self.__two_gaussians, all_x, all_y, p0 = popt_guesses, \
+                popt, _ = curve_fit(self.__two_gaussians, bin_centers, count, p0 = popt_guesses, \
                     bounds=([bin_centers_empty[0], 0, 0, bin_centers_empty[0], 0],\
                             [rough_treshold, np.inf, 1, bin_centers_occ[-1], np.inf]))
             except ValueError:
@@ -980,16 +939,6 @@ class ImageAnalysisProjection(ImageAnalysis):
                     if t < first_peak or t > second_peak:
                         t = (-b+s) / (2 * a)
 
-            all_data_points = np.concatenate([bin_centers_empty, bin_centers_occ])
-            if self.print_info:
-                plt.plot(bin_centers_empty, count_empty)
-                plt.plot(bin_centers_occ, count_occ)
-                plt.plot(all_data_points, self.__two_gaussians(all_data_points, first_peak, sigma1, filling_ratio, second_peak, sigma2))
-                plt.title("Emission values, fit, and threshold for trap (group) " + str(p_index))
-                plt.vlines([t], 0, count.max(), colors=['red'])
-                plt.legend(['Empty count', 'Occ count', 'Total fit', 'Detected threshold'])
-                plt.show()
-
             for atom_location_index, parameter_index in enumerate(atom_site_index_to_parameter_index):
                 if parameter_index == p_index:
                     self.threshold[atom_location_index] = t
@@ -999,7 +948,22 @@ class ImageAnalysisProjection(ImageAnalysis):
             fidelity1 = norm.sf(t, loc = second_peak, scale = sigma2)
             fidelities1.append(fidelity1)
             fidelities.append((1 - filling_ratio) * fidelity0 + filling_ratio * fidelity1)
-        return first_peak, second_peak, fidelities, fidelities0, fidelities1, filling_ratio
+
+            average_filling_ratio += filling_ratio / len(parameters)
+            first_peaks.append(first_peak)
+            second_peaks.append(second_peak)
+
+            if self.print_info:
+                plt.plot(bin_centers, count)
+                plt.plot(bin_centers, self.__two_gaussians(bin_centers, first_peak, sigma1, filling_ratio, second_peak, sigma2))
+                plt.title("Emission values, fit, and threshold for trap (group) " + str(p_index) + \
+                          ", fidelities: 0: " + str(fidelity0) + "; 1: " + str(fidelity1) + "; t: " + \
+                          str((1 - filling_ratio) * fidelity0 + filling_ratio * fidelity1))
+                plt.vlines([t], 0, count.max(), colors='red')
+                plt.legend(['Counts', 'Total fit', 'Detected threshold'])
+                plt.show()
+
+        return first_peaks, second_peaks, fidelities, fidelities0, fidelities1, average_filling_ratio
     
 
     def calibrate_from_known(self, images, atom_locations : list[tuple[float,float]], psf = None,
@@ -1025,9 +989,9 @@ class ImageAnalysisProjection(ImageAnalysis):
             "image" to use provided average_closed_shutter_image. If "image" and not average_closed_shutter_image provided, "rowcol" is used, defaults to "image"
         :type camera_noise_reduction_method: string, optional
         :raises AttributeError: Combination of attributes is not meaningful
-        :return: List of detection threshold per site, [Empty-peak emission value, Occupied-peak emission value], Fidelity per atom site, 
+        :return: List of detection threshold per site, [Empty-peak emission values, Occupied-peak emission values], Fidelity per atom site, 
             Fidelity0 (Fraction of empty sites detected as such) per atom site, Fidelity1 (Fraction of occupied sites detected as such) per atom site, Filling ratio
-        :rtype: list[float], [float, float], list[float], list[float], list[float], float
+        :rtype: list[float], [list[float], list[float]], list[float], list[float], list[float], float
         """
         start_time = datetime.now()
         
@@ -1134,9 +1098,9 @@ class ImageAnalysisProjection(ImageAnalysis):
             Does not remove any sites if None, default to None
         :type remove_sites_under_fit_height_percentile: float, optional
         :raises AttributeError: Combination of attributes is not meaningful
-        :return: List of detection threshold per site, [Empty-peak emission value, Occupied-peak emission value], Fidelity per atom site, 
+        :return: List of detection threshold per site, [Empty-peak emission values, Occupied-peak emission values], Fidelity per atom site, 
             Fidelity0 (Fraction of empty sites detected as such) per atom site, Fidelity1 (Fraction of occupied sites detected as such) per atom site, Filling ratio
-        :rtype: list[float], [float, float], list[float], list[float], list[float], float
+        :rtype: list[float], [list[float], list[float]], list[float], list[float], list[float], float
         """
         start_time = datetime.now()
         
