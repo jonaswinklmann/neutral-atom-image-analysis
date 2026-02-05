@@ -857,7 +857,8 @@ class ImageAnalysisProjection(ImageAnalysis):
 
         for p_index, parameters_individual in enumerate(parameters):
             # Prepare histogram for threshold detection
-            count, bin_edges = np.histogram(parameters_individual, bins=2 * int(np.sqrt(len(parameters_individual))))
+            bin_count = 2 * int(math.sqrt(len(parameters_individual)))
+            count, bin_edges = np.histogram(parameters_individual, bins=bin_count)
             bin_size = bin_edges[1] - bin_edges[0]
             count = np.array(count).astype(np.float64) / len(parameters_individual) / bin_size
             bin_centers = (np.array(bin_edges[:-1]) + np.array(bin_edges[1:])) / 2
@@ -956,9 +957,15 @@ class ImageAnalysisProjection(ImageAnalysis):
             if self.print_info:
                 plt.plot(bin_centers, count)
                 plt.plot(bin_centers, self.__two_gaussians(bin_centers, first_peak, sigma1, filling_ratio, second_peak, sigma2))
-                plt.title("Emission values, fit, and threshold for trap (group) " + str(p_index) + \
-                          ", fidelities: 0: " + str(fidelity0) + "; 1: " + str(fidelity1) + "; t: " + \
-                          str((1 - filling_ratio) * fidelity0 + filling_ratio * fidelity1))
+                text_y = count.max() * 0.75
+                second_peak_height = self.__two_gaussians(second_peak, first_peak, sigma1, filling_ratio, second_peak, sigma2)
+                if second_peak_height > text_y:
+                    plt.text(t, second_peak_height, "Fidelity0: " + str(fidelity0) + "\nFidelity0: " + str(fidelity1) + 
+                             "\nAverage: " + str((1 - filling_ratio) * fidelity0 + filling_ratio * fidelity1), va='bottom')
+                else:
+                    plt.text(t, text_y, "Fidelity0: " + str(fidelity0) + "\nFidelity0: " + str(fidelity1) + 
+                             "\nAverage: " + str((1 - filling_ratio) * fidelity0 + filling_ratio * fidelity1), va='top')
+                plt.title("Emission values, fit, and threshold for trap (group) " + str(p_index))
                 plt.vlines([t], 0, count.max(), colors='red')
                 plt.legend(['Counts', 'Total fit', 'Detected threshold'])
                 plt.show()
