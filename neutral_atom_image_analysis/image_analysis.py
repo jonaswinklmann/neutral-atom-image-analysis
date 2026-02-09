@@ -24,7 +24,7 @@ from scipy.interpolate import interp1d
 from scipy.ndimage import zoom, shift
 from scipy.optimize import curve_fit, OptimizeWarning
 from scipy.stats import norm
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, convolve2d
 from scipy.spatial import Voronoi, voronoi_plot_2d, distance
 import numpy as np
 import abc
@@ -67,7 +67,7 @@ class ImageAnalysisProjection(ImageAnalysis):
 
     def __gaussian_2d(self, x, loc_x, loc_y, scale_x, scale_y, offset, mult):
         return np.array(norm.pdf(x[0], loc = loc_y, scale = scale_y) * norm.pdf(x[1], loc = loc_x, scale = scale_x) * mult + offset).ravel()
-
+    
     def __gaussian_wrapped(self, x, loc, scale, mult):
         return norm.pdf(x, loc=loc, scale=scale) * mult
 
@@ -315,8 +315,9 @@ class ImageAnalysisProjection(ImageAnalysis):
                     x_max = average_image.shape[1] - x_start
                 x_data = np.mgrid[0:x_max, 0:y_max]
                 y_data = np.array(average_image[x_start:x_start + x_max, y_start:y_start + y_max])
-                max_index = np.unravel_index(y_data.argmax(), y_data.shape)
-                init_guesses = [max_index[1], max_index[0], 5, 5, y_data.min(),\
+                max_3x3 = convolve2d(np.array(y_data), np.ones((3,3)), mode='valid')
+                max_index = np.unravel_index(max_3x3.argmax(), max_3x3.shape)
+                init_guesses = [max_index[1] + 1, max_index[0] + 1, 5, 5, y_data.min(),\
                                 (y_data.max() - y_data.min()) * gaussian_peak_default * gaussian_peak_default * 25]
                 all_bounds = ([0,0,0,0,-np.inf,0],[y_max,x_max,np.inf,np.inf,np.inf,np.inf])
                 try:
@@ -326,8 +327,38 @@ class ImageAnalysisProjection(ImageAnalysis):
                     continue
                 all_mults.append(popt[5])
                 self.atom_locations[i] = np.array((x_start + popt[1], y_start + popt[0]))
+        elif remove_sites_under_fit_height_percentile is not None and remove_sites_under_fit_height_percentile > 0:
+            all_mults = []
+            for i in range(len(self.atom_locations)):
+                x, y = self.atom_locations[i]
+                y_start = int(y - self.spacing[0] / 2)
+                y_max = int(self.spacing[0])
+                if y_start < 0:
+                    y_start = 0
+                if y_start + y_max > average_image.shape[0]:
+                    y_max = average_image.shape[0] - y_start
+                x_start = int(x - self.spacing[1] / 2)
+                x_max = int(self.spacing[1])
+                if x_start < 0:
+                    x_start = 0
+                if x_start + x_max > average_image.shape[1]:
+                    x_max = average_image.shape[1] - x_start
+                x_data = np.mgrid[0:x_max, 0:y_max]
+                y_data = np.array(average_image[x_start:x_start + x_max, y_start:y_start + y_max])
+                max_3x3 = convolve2d(np.array(y_data), np.ones((3,3)), mode='valid')
+                max_index = np.unravel_index(max_3x3.argmax(), max_3x3.shape)
+                init_guesses = [5, 5, y_data.min(), (y_data.max() - y_data.min()) * gaussian_peak_default * gaussian_peak_default * 25]
+                all_bounds = ([0,0,-np.inf,0],[np.inf,np.inf,np.inf,np.inf])
+                try:
+                    popt, _ = curve_fit(lambda data, scale_x, scale_y, offset, mult: \
+                                        self.__gaussian_2d(data, y - y_start, x - x_start, scale_x, scale_y, offset, mult), \
+                                        x_data, y_data.ravel(), p0=init_guesses, bounds=all_bounds)
+                except:
+                    all_mults.append(0)
+                    continue
+                all_mults.append(popt[3])
 
-        if remove_sites_under_fit_height_percentile is not None:
+        if remove_sites_under_fit_height_percentile is not None and remove_sites_under_fit_height_percentile > 0:
             bin_count = int(math.sqrt(len(self.atom_locations)))
             if bin_count < 10:
                 bin_count = 10
@@ -864,45 +895,37 @@ class ImageAnalysisProjection(ImageAnalysis):
             bin_centers = (np.array(bin_edges[:-1]) + np.array(bin_edges[1:])) / 2
 
             first_peak_index = np.argmax(count)
-            min_index = first_peak_index + np.argmax(np.diff(count[first_peak_index:]) > 0)
-            second_peak_index = (min_index + np.argmax(count[min_index:]))
-            rough_treshold = (bin_centers[second_peak_index] + bin_centers[first_peak_index]) / 2
-
-            parameters_empty = [p for p in parameters_individual if p <= rough_treshold]
-            parameters_occ = [p for p in parameters_individual if p >= rough_treshold]
-
-            count_empty, bin_edges_empty = np.histogram(parameters_empty, bins=int(np.sqrt(len(parameters_empty))))
-            bin_size_empty = bin_edges_empty[1] - bin_edges_empty[0]
-            count_empty = np.pad(np.array(count_empty).astype(np.float64) / len(parameters_individual) / bin_size_empty, (1,1), mode='constant')
-            bin_centers_empty = np.pad((np.array(bin_edges_empty[:-1]) + np.array(bin_edges_empty[1:])) / 2, (1,1))
-            bin_centers_empty[0] = bin_centers_empty[1] - bin_size_empty
-            bin_centers_empty[-1] = bin_centers_empty[-2] + bin_size_empty
-
-            count_occ, bin_edges_occ = np.histogram(parameters_occ, bins=int(np.sqrt(len(parameters_occ))))
-            bin_size_occ = bin_edges_occ[1] - bin_edges_occ[0]
-            count_occ = np.pad(np.array(count_occ).astype(np.float64) / len(parameters_individual) / bin_size_occ, (1,1), mode='constant')
-            bin_centers_occ = np.pad((np.array(bin_edges_occ[:-1]) + np.array(bin_edges_occ[1:])) / 2, (1,1))
-            bin_centers_occ[0] = bin_centers_occ[1] - bin_size_occ
-            bin_centers_occ[-1] = bin_centers_occ[-2] + bin_size_occ
-
-            # Find guesses for Gaussian fit
-            peaks, properties = find_peaks(count_empty, prominence=0.00001)
-            peak_index_in_peaks = np.argmax(properties['prominences'])
-            first_peak_index = peaks[peak_index_in_peaks]
-            peaks, properties = find_peaks(count_occ, prominence=0.00001)
-            peak_index_in_peaks = np.argmax(properties['prominences'])
-            second_peak_index = peaks[peak_index_in_peaks]
-
-            # Fit gaussian to acquire distributions
-            gaussian_peak_default = 0.39894228047
+            if first_peak_index < len(count) / 2:
+                start_index = 0
+                end_index = 2 * first_peak_index + 1
+            else:
+                start_index = first_peak_index - (len(count) - first_peak_index - 1)
+                end_index = len(count)
+            
+            popt, _ = curve_fit(self.__gaussian_wrapped, bin_centers[start_index:end_index], count[start_index:end_index], p0=[bin_centers[first_peak_index], bin_size, 1])
+            first_peak = popt[0]
+            first_peak_scale = popt[1]
+            count_without_first_peak = count - self.__gaussian_wrapped(bin_centers, *popt)
+            second_peak_index = np.argmax(count_without_first_peak)
+            popt, _ = curve_fit(self.__gaussian_wrapped, bin_centers, count_without_first_peak, p0=[bin_centers[second_peak_index], bin_size, 1])
+            second_peak = popt[0]
+            second_peak_scale = popt[1]
+            if first_peak > second_peak:
+                tmp_peak = second_peak
+                tmp_peak_scale = second_peak_scale
+                second_peak = first_peak
+                second_peak_scale = first_peak_scale
+                first_peak = tmp_peak
+                first_peak_scale = tmp_peak_scale
 
             popt = None
-            popt_guesses = [bin_centers_empty[first_peak_index], gaussian_peak_default / count_empty[first_peak_index],\
-                0.5, bin_centers_occ[second_peak_index], gaussian_peak_default / count_occ[second_peak_index]]
+            popt_guesses = [first_peak, first_peak_scale, 0.5, second_peak, second_peak_scale]
+            #popt_guesses = [bin_centers_empty[first_peak_index], gaussian_peak_default / count_empty[first_peak_index],\
+            #    0.5, bin_centers_occ[second_peak_index], gaussian_peak_default / count_occ[second_peak_index]]
             try:
                 popt, _ = curve_fit(self.__two_gaussians, bin_centers, count, p0 = popt_guesses, \
-                    bounds=([bin_centers_empty[0], 0, 0, bin_centers_empty[0], 0],\
-                            [rough_treshold, np.inf, 1, bin_centers_occ[-1], np.inf]))
+                    bounds=([np.array(parameters_individual).min(), 0, 0, np.array(parameters_individual).min(), 0],\
+                            [np.array(parameters_individual).max(), np.inf, 1, np.array(parameters_individual).max(), np.inf]))
             except ValueError:
                 print("Either ydata or xdata contained NaNs, or incompatible options were used for curve_fitting for threshold detection! Using rough estimations")
                 popt = popt_guesses
@@ -957,14 +980,8 @@ class ImageAnalysisProjection(ImageAnalysis):
             if self.print_info:
                 plt.plot(bin_centers, count)
                 plt.plot(bin_centers, self.__two_gaussians(bin_centers, first_peak, sigma1, filling_ratio, second_peak, sigma2))
-                text_y = count.max() * 0.75
-                second_peak_height = self.__two_gaussians(second_peak, first_peak, sigma1, filling_ratio, second_peak, sigma2)
-                if second_peak_height > text_y:
-                    plt.text(t, second_peak_height, "Fidelity0: " + str(fidelity0) + "\nFidelity0: " + str(fidelity1) + 
-                             "\nAverage: " + str((1 - filling_ratio) * fidelity0 + filling_ratio * fidelity1), va='bottom')
-                else:
-                    plt.text(t, text_y, "Fidelity0: " + str(fidelity0) + "\nFidelity0: " + str(fidelity1) + 
-                             "\nAverage: " + str((1 - filling_ratio) * fidelity0 + filling_ratio * fidelity1), va='top')
+                plt.text(t, count.max() * 0.75, "Fidelity0: " + str(fidelity0) + "\nFidelity0: " + str(fidelity1) + 
+                         "\nAverage: " + str((1 - filling_ratio) * fidelity0 + filling_ratio * fidelity1), va='top')
                 plt.title("Emission values, fit, and threshold for trap (group) " + str(p_index))
                 plt.vlines([t], 0, count.max(), colors='red')
                 plt.legend(['Counts', 'Total fit', 'Detected threshold'])
