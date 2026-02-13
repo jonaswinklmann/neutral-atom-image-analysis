@@ -22,10 +22,11 @@ from skimage.segmentation import watershed
 from skimage.transform import radon
 from scipy.interpolate import interp1d
 from scipy.ndimage import zoom, shift
-from scipy.optimize import curve_fit, OptimizeWarning
-from scipy.stats import norm
+from scipy.optimize import curve_fit, OptimizeWarning, fsolve
+from scipy.stats import norm, skewnorm
 from scipy.signal import find_peaks, convolve2d
 from scipy.spatial import Voronoi, voronoi_plot_2d, distance
+from scipy.special import gamma, gammaincc
 import numpy as np
 import abc
 
@@ -59,6 +60,31 @@ class ImageAnalysisProjection(ImageAnalysis):
         return norm.pdf(x, loc = loc1, scale = scale1) * (1 - f) + \
             norm.pdf(x, loc = loc2, scale = scale2) * f
 
+    def __two_skewed_gaussians(self, x, scew1, loc1, scale1, f, scew2, loc2, scale2):
+        return skewnorm.pdf(x, scew1, loc = loc1, scale = scale1) * (1 - f) + \
+            skewnorm.pdf(x, scew2, loc = loc2, scale = scale2) * f
+    
+    def __normalized_super_asymmetric_gaussian(self, x, loc, scale, exp_a, exp_b):
+        return ((x <= loc) * np.exp(-abs(x - loc) ** exp_a / scale ** 2) + \
+                (x > loc) * np.exp(-abs(x - loc) ** exp_b / scale ** 2)) /\
+                (scale ** (2 / exp_a) * gamma(1 / exp_a) / exp_a + scale ** (2 / exp_b) * gamma(1 / exp_b) / exp_b)
+    
+    def __cumulative_normalized_super_asymmetric_gaussian(self, x, loc, scale, exp_a, exp_b):
+        if x < loc:
+            return (scale ** (2 / exp_a) * gamma(1 / exp_a) * gammaincc(1 / exp_a, (loc - x) ** exp_a / scale ** 2) / exp_a) /\
+                (scale ** (2 / exp_a) * gamma(1 / exp_a) / exp_a + scale ** (2 / exp_b) * gamma(1 / exp_b) / exp_b)
+        else:
+            return 1 - (scale ** (2 / exp_b) * gamma(1 / exp_b) * gammaincc(1 / exp_b, (x - loc) ** exp_b / scale ** 2) / exp_b) /\
+                (scale ** (2 / exp_a) * gamma(1 / exp_a) / exp_a + scale ** (2 / exp_b) * gamma(1 / exp_b) / exp_b)
+
+    def __gaussian_plus_super_asymmetric_gaussian(self, x, loc1, scale1, f, loc2, scale2, exp2_a, exp2_b):
+        return norm.pdf(x, loc = loc1, scale = scale1) * (1 - f) + \
+            self.__normalized_super_asymmetric_gaussian(x, loc2, scale2, exp2_a, exp2_b) * f
+
+    def __gaussian_minus_super_asymmetric_gaussian(self, x, loc1, scale1, f, loc2, scale2, exp2_a, exp2_b):
+        return norm.pdf(x, loc = loc1, scale = scale1) * (1 - f) - \
+            self.__normalized_super_asymmetric_gaussian(x, loc2, scale2, exp2_a, exp2_b) * f
+
     def __gaussian_peak_empty(self, x, loc1, scale1, f):
         return norm.pdf(x, loc = loc1, scale = scale1) * (1 - f)
 
@@ -67,6 +93,9 @@ class ImageAnalysisProjection(ImageAnalysis):
 
     def __gaussian_2d(self, x, loc_x, loc_y, scale_x, scale_y, offset, mult):
         return np.array(norm.pdf(x[0], loc = loc_y, scale = scale_y) * norm.pdf(x[1], loc = loc_x, scale = scale_x) * mult + offset).ravel()
+    
+    def __gaussian_2d_unravelled(self, x, loc_x, loc_y, scale_x, scale_y, offset, mult):
+        return np.array(norm.pdf(x[0], loc = loc_y, scale = scale_y) * norm.pdf(x[1], loc = loc_x, scale = scale_x) * mult + offset)
     
     def __gaussian_wrapped(self, x, loc, scale, mult):
         return norm.pdf(x, loc=loc, scale=scale) * mult
@@ -313,15 +342,16 @@ class ImageAnalysisProjection(ImageAnalysis):
                     x_start = 0
                 if x_start + x_max > average_image.shape[1]:
                     x_max = average_image.shape[1] - x_start
-                x_data = np.mgrid[0:x_max, 0:y_max]
+                x_data = np.mgrid[0:x_max - 2, 0:y_max - 2]
                 y_data = np.array(average_image[x_start:x_start + x_max, y_start:y_start + y_max])
-                max_3x3 = convolve2d(np.array(y_data), np.ones((3,3)), mode='valid')
+                max_3x3 = convolve2d(np.array(y_data), \
+                    self.__gaussian_2d_unravelled(np.mgrid[0:3, 0:3], 1, 1, 1, 1, 0, 1), mode='valid')
                 max_index = np.unravel_index(max_3x3.argmax(), max_3x3.shape)
-                init_guesses = [max_index[1] + 1, max_index[0] + 1, 5, 5, y_data.min(),\
-                                (y_data.max() - y_data.min()) * gaussian_peak_default * gaussian_peak_default * 25]
+                init_guesses = [max_index[1] + 1, max_index[0] + 1, 5, 5, max_3x3.min(),\
+                                (max_3x3.max() - max_3x3.min()) * gaussian_peak_default * gaussian_peak_default * 25]
                 all_bounds = ([0,0,0,0,-np.inf,0],[y_max,x_max,np.inf,np.inf,np.inf,np.inf])
                 try:
-                    popt, _ = curve_fit(self.__gaussian_2d, x_data, y_data.ravel(), p0=init_guesses, bounds=all_bounds)
+                    popt, _ = curve_fit(self.__gaussian_2d, x_data, max_3x3.ravel(), p0=init_guesses, bounds=all_bounds)
                 except: 
                     all_mults.append(0)
                     continue
@@ -919,13 +949,11 @@ class ImageAnalysisProjection(ImageAnalysis):
                 first_peak_scale = tmp_peak_scale
 
             popt = None
-            popt_guesses = [first_peak, first_peak_scale, 0.5, second_peak, second_peak_scale]
-            #popt_guesses = [bin_centers_empty[first_peak_index], gaussian_peak_default / count_empty[first_peak_index],\
-            #    0.5, bin_centers_occ[second_peak_index], gaussian_peak_default / count_occ[second_peak_index]]
+            popt_guesses = [first_peak, first_peak_scale, 0.5, second_peak, second_peak_scale, 2, 2]
             try:
-                popt, _ = curve_fit(self.__two_gaussians, bin_centers, count, p0 = popt_guesses, \
-                    bounds=([np.array(parameters_individual).min(), 0, 0, np.array(parameters_individual).min(), 0],\
-                            [np.array(parameters_individual).max(), np.inf, 1, np.array(parameters_individual).max(), np.inf]))
+                popt, _ = curve_fit(self.__gaussian_plus_super_asymmetric_gaussian, bin_centers, count, p0 = popt_guesses, \
+                    bounds=([np.array(parameters_individual).min(), 0, 0, np.array(parameters_individual).min(), 0, 0, 0],\
+                            [np.array(parameters_individual).max(), np.inf, 1, np.array(parameters_individual).max(), np.inf, np.inf, np.inf]))
             except ValueError:
                 print("Either ydata or xdata contained NaNs, or incompatible options were used for curve_fitting for threshold detection! Using rough estimations")
                 popt = popt_guesses
@@ -943,25 +971,11 @@ class ImageAnalysisProjection(ImageAnalysis):
             second_peak = popt[3]
             sigma2 = popt[4]
 
-            # Calculate threshold so that weighted pdf is equal, i.e. minimize total error for given filling ratio
-            a = 1 / (2 * sigma2**2) - 1 / (2 * sigma1**2)
-            if a == 0 or sigma1 == 0 or sigma2 == 0 or filling_ratio == 0 or \
-                ((1 - filling_ratio) * sigma2) / (filling_ratio * sigma1) <= 0:
-                print("Division by zero. Setting threshold to middle between two peaks")
-                t = (first_peak + second_peak) / 2
-            else:
-                b = first_peak / (sigma1**2) - second_peak / (sigma2**2)
-                c = (second_peak**2) / (2 * sigma2**2) - (first_peak**2) / (2 * sigma1**2) + math.log(((1 - filling_ratio) * sigma2) / (filling_ratio * sigma1))
-                d = b**2 - 4 * a * c
-                if d < 0:
-                    print("No intersection between curves. Setting threshold to middle between two peaks")
-                    t = (first_peak + second_peak) / 2
-                else:
-                    s = math.sqrt(d)
-
-                    t = (-b-s) / (2 * a)
-                    if t < first_peak or t > second_peak:
-                        t = (-b+s) / (2 * a)
+            all_roots = fsolve(self.__gaussian_minus_super_asymmetric_gaussian, (first_peak + second_peak) / 2, args=tuple(popt))
+            for root in all_roots:
+                if root > first_peak and root < second_peak:
+                    t = root
+                    break
 
             for atom_location_index, parameter_index in enumerate(atom_site_index_to_parameter_index):
                 if parameter_index == p_index:
@@ -969,7 +983,7 @@ class ImageAnalysisProjection(ImageAnalysis):
 
             fidelity0 = norm.cdf(t, loc = first_peak, scale = sigma1)
             fidelities0.append(fidelity0)
-            fidelity1 = norm.sf(t, loc = second_peak, scale = sigma2)
+            fidelity1 = 1 - self.__cumulative_normalized_super_asymmetric_gaussian(t, popt[3], popt[4], popt[5], popt[6])
             fidelities1.append(fidelity1)
             fidelities.append((1 - filling_ratio) * fidelity0 + filling_ratio * fidelity1)
 
@@ -979,7 +993,7 @@ class ImageAnalysisProjection(ImageAnalysis):
 
             if self.print_info:
                 plt.plot(bin_centers, count)
-                plt.plot(bin_centers, self.__two_gaussians(bin_centers, first_peak, sigma1, filling_ratio, second_peak, sigma2))
+                plt.plot(bin_centers, self.__gaussian_plus_super_asymmetric_gaussian(bin_centers, *popt))
                 plt.text(t, count.max() * 0.75, "Fidelity0: " + str(fidelity0) + "\nFidelity0: " + str(fidelity1) + 
                          "\nAverage: " + str((1 - filling_ratio) * fidelity0 + filling_ratio * fidelity1), va='top')
                 plt.title("Emission values, fit, and threshold for trap (group) " + str(p_index))
