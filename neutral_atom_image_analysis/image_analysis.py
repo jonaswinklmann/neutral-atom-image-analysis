@@ -966,22 +966,24 @@ class ImageAnalysisProjection(ImageAnalysis):
                     popt = popt_guesses
 
             first_peak = popt[0]
-            sigma1 = popt[1]
             filling_ratio = popt[2]            
             second_peak = popt[3]
-            sigma2 = popt[4]
 
+            t = None
             all_roots = fsolve(self.__gaussian_minus_super_asymmetric_gaussian, (first_peak + second_peak) / 2, args=tuple(popt))
             for root in all_roots:
                 if root > first_peak and root < second_peak:
                     t = root
                     break
+            if t is None:
+                print("Intersection of first and second peak could not be established. Using average of the two centers")
+                t = (first_peak + second_peak) / 2
 
             for atom_location_index, parameter_index in enumerate(atom_site_index_to_parameter_index):
                 if parameter_index == p_index:
                     self.threshold[atom_location_index] = t
 
-            fidelity0 = norm.cdf(t, loc = first_peak, scale = sigma1)
+            fidelity0 = norm.cdf(t, loc = first_peak, scale = popt[1])
             fidelities0.append(fidelity0)
             fidelity1 = 1 - self.__cumulative_normalized_super_asymmetric_gaussian(t, popt[3], popt[4], popt[5], popt[6])
             fidelities1.append(fidelity1)
