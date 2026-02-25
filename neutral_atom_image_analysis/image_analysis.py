@@ -614,12 +614,6 @@ class ImageAnalysisProjection(ImageAnalysis):
                     print("Curve fitting for threshold for psf acquisition failed. Using rough estimate")
                     threshold = (bin_centers[first_peak_index] + len(count)) / 2
                     empty_threshold = bin_centers[first_peak_index]
-        
-        plt.plot(bin_centers, count)
-        plt.plot(bin_centers, self.__two_gaussians(bin_centers, *popt))
-        plt.vlines([empty_threshold, threshold], ymin=0, ymax=max(count), colors=['green', 'red'])
-        plt.title("Curve fitting for voronoi")
-        plt.show()
 
         voronoi_generator_cpp = neutral_atom_image_analysis_cpp.VoronoiGenerator()
 
