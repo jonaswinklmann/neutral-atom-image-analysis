@@ -13,19 +13,15 @@ import neutral_atom_image_analysis_cpp
 import state_reconstruction
 from state_reconstruction.gen.image_gen import get_local_psfs
 from state_reconstruction.gen.proj_gen import get_embedded_local_psfs, get_embedded_projectors, crop_projector
-import matplotlib as mpl
 import matplotlib.pyplot as plt
-from libics.tools import plot
 from libics.tools.trafo.linear import AffineTrafo2d
 from pandas import DataFrame
-from skimage.segmentation import watershed
 from skimage.transform import radon
 from scipy.interpolate import interp1d
-from scipy.ndimage import zoom, shift
+from scipy.ndimage import shift
 from scipy.optimize import curve_fit, OptimizeWarning, fsolve
 from scipy.stats import norm, skewnorm
 from scipy.signal import find_peaks, convolve2d
-from scipy.spatial import Voronoi, voronoi_plot_2d, distance
 from scipy.special import gamma, gammaincc
 import numpy as np
 import abc
@@ -905,7 +901,7 @@ class ImageAnalysisProjection(ImageAnalysis):
             self._generate_and_set_projectors_high_spacing(proj_shape)
 
     
-    def _calibrate_threshold(self, parameters, atom_site_index_to_parameter_index):
+    def _calibrate_threshold(self, parameters, atom_site_index_to_parameter_index, histogram_path):
         self.threshold = [0] * len(self.atom_locations)
 
         fidelities = []
@@ -976,8 +972,12 @@ class ImageAnalysisProjection(ImageAnalysis):
                     t = root
                     break
             if t is None:
-                print("Intersection of first and second peak could not be established. Using average of the two centers")
-                t = (first_peak + second_peak) / 2
+                target_fidelity0 = 0.001
+                if len(fidelities0) > 0:
+                    target_fidelity0 = np.average(fidelities0)
+                print("Intersection of first and second peak could not be established at site (group) " + str(p_index) +\
+                      ". Setting threshold so fidelity 0 matches other sites")
+                t = norm.ppf(target_fidelity0, loc = first_peak, scale = popt[1])
 
             for atom_location_index, parameter_index in enumerate(atom_site_index_to_parameter_index):
                 if parameter_index == p_index:
@@ -993,15 +993,16 @@ class ImageAnalysisProjection(ImageAnalysis):
             first_peaks.append(first_peak)
             second_peaks.append(second_peak)
 
-            if self.print_info:
+            if histogram_path is not None and isinstance(histogram_path, str):
                 plt.plot(bin_centers, count)
                 plt.plot(bin_centers, self.__gaussian_plus_super_asymmetric_gaussian(bin_centers, *popt))
-                plt.text(t, count.max() * 0.75, "Fidelity0: " + str(fidelity0) + "\nFidelity0: " + str(fidelity1) + 
+                plt.text(t, count.max() * 0.75, "Fidelity0: " + str(fidelity0) + "\nFidelity1: " + str(fidelity1) + 
                          "\nAverage: " + str((1 - filling_ratio) * fidelity0 + filling_ratio * fidelity1), va='top')
                 plt.title("Emission values, fit, and threshold for trap (group) " + str(p_index))
                 plt.vlines([t], 0, count.max(), colors='red')
                 plt.legend(['Counts', 'Total fit', 'Detected threshold'])
-                plt.show()
+                plt.savefig(os.path.join(histogram_path, "histogram_fit" + str(p_index) + ".png"))
+                plt.clf()
 
         return first_peaks, second_peaks, fidelities, fidelities0, fidelities1, average_filling_ratio
     
@@ -1107,7 +1108,7 @@ class ImageAnalysisProjection(ImageAnalysis):
     def calibrate(self, images, average_closed_shutter_image = None, proj_shape : tuple[int,int] = None, 
         min_cal_samples = None, site_detection_threshold = 0.2, extend_locations_to_fov = False, 
         psf_distance_mult = 2, camera_noise_reduction_method = "image", angle_guesses : tuple[int,int] = (90, 0),
-        optimize_locations_individually = False, remove_sites_under_fit_height_percentile = None):
+        optimize_locations_individually = False, remove_sites_under_fit_height_percentile = None, histogram_path = None):
         """Function to calibrate the image analysis
 
         :param images: The images to be used for calibration. Should be iterable with each element being either a DataFrame or convertible to a numpy array
@@ -1135,14 +1136,19 @@ class ImageAnalysisProjection(ImageAnalysis):
         :type optimize_locations_individually: bool, optional
         :param remove_sites_under_fit_height_percentile: Remove trap locations from the grid where the detected brightness peak is very low. \
             All sites are removed where the peak height is below the percentile point function of remove_sites_under_fit_height_percentile and the fitted peak-height-parameters across all sites.\
-            Does not remove any sites if None, default to None
+            Does not remove any sites if None, defaults to None
         :type remove_sites_under_fit_height_percentile: float, optional
+        :param histogram_path: Path used to save threshold histograms during calibration. Histograms not saved if None, defaults to None
+        :type histogram_path: string, optional
         :raises AttributeError: Combination of attributes is not meaningful
         :return: List of detection threshold per site, [Empty-peak emission values, Occupied-peak emission values], Fidelity per atom site, 
             Fidelity0 (Fraction of empty sites detected as such) per atom site, Fidelity1 (Fraction of occupied sites detected as such) per atom site, Filling ratio
         :rtype: list[float], [list[float], list[float]], list[float], list[float], list[float], float
         """
         start_time = datetime.now()
+
+        if images is None or not hasattr(images, '__iter__') or len(images) == 0:
+            raise TypeError("List of images either not set, not iterable, or empty")
         
         average_filled_image, self.average_closed_shutter_image = self._get_average_images(images, camera_noise_reduction_method, average_closed_shutter_image)
         
@@ -1156,7 +1162,7 @@ class ImageAnalysisProjection(ImageAnalysis):
             if len(self.atom_locations) < 1000:
                 for loc in self.atom_locations:
                     plt.plot(loc[1], loc[0], marker='x', color="red") 
-            plot.show()
+            plt.show()
             print("Acquiring PSF")
 
         self._find_psf(images, self.average_closed_shutter_image, psf_distance_mult)
@@ -1185,7 +1191,7 @@ class ImageAnalysisProjection(ImageAnalysis):
             print("All images reconstructed within " + str((datetime.now() - start_time_reconstruct).total_seconds() * 1e3) + "ms")
 
         first_peak, second_peak, fidelities, fidelities0, fidelities1, filling_ratio = \
-            self._calibrate_threshold(parameters, atom_site_index_to_parameter_index)
+            self._calibrate_threshold(parameters, atom_site_index_to_parameter_index, histogram_path)
         if self.print_info:
             print("F0 avg: " + str(np.average(fidelities0)))
             print("F1 avg: " + str(np.average(fidelities1)))
