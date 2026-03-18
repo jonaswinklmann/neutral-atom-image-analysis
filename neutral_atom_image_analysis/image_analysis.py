@@ -10,11 +10,7 @@ sys.path.insert(0, os.path.dirname(__file__) + "/")
 from datetime import datetime
 import math
 import neutral_atom_image_analysis_cpp
-import state_reconstruction
-from state_reconstruction.gen.image_gen import get_local_psfs
-from state_reconstruction.gen.proj_gen import get_embedded_local_psfs, get_embedded_projectors, crop_projector
 import matplotlib.pyplot as plt
-from libics.tools.trafo.linear import AffineTrafo2d
 from pandas import DataFrame
 from skimage.transform import radon
 from scipy.interpolate import interp1d
@@ -727,85 +723,79 @@ class ImageAnalysisProjection(ImageAnalysis):
     
 
     def _generate_and_set_projectors_low_spacing(self, proj_shape):
-        trafo_site_to_image = AffineTrafo2d()
-        # Set site unit vectors within image coordinate system
-        trafo_site_to_image.set_origin_axes(
-            magnification=(self.spacing[1],self.spacing[0]),
-            angle=np.deg2rad((self.angle[1],self.angle[0]))
-        )
-        trafo_site_to_image.set_offset_by_point_pair(
-            [0,0], self._image_ref
-        )
+        try:
+            import state_reconstruction
+            from libics.tools.trafo.linear import AffineTrafo2d
+        except ImportError:
+            if self.print_info:
+                print("Projectors should have been generated using embedded neighboring PSFs, but requirements state_reconstruction and/or libics are not installed")
+            self._generate_and_set_projectors_no_dependencies(proj_shape)
+        else:
+            trafo_site_to_image = AffineTrafo2d()
+            # Set site unit vectors within image coordinate system
+            trafo_site_to_image.set_origin_axes(
+                magnification=(self.spacing[1],self.spacing[0]),
+                angle=np.deg2rad((self.angle[1],self.angle[0]))
+            )
+            trafo_site_to_image.set_offset_by_point_pair(
+                [0,0], self._image_ref
+            )
 
-        ipsf_gen = state_reconstruction.IntegratedPsfGenerator(
-            psf=self.psf, psf_supersample=self.psf_supersample
-        )
+            ipsf_gen = state_reconstruction.IntegratedPsfGenerator(
+                psf=self.psf, psf_supersample=self.psf_supersample
+            )
 
-        if self.print_info and self.psf_supersample > 1:
-            print("Integrated subpixel PSFs:")
-            fig, ax = plt.subplots(self.psf_supersample, self.psf_supersample)
-            half_supersample = self.psf_supersample // 2
-            for i in range(self.psf_supersample):
-                for j in range(self.psf_supersample):
-                    ax[i,j].imshow(ipsf_gen.generate_integrated_psf(i - half_supersample, j - half_supersample))
-            fig.show()
+            proj_gen = state_reconstruction.ProjectorGenerator(
+                trafo_site_to_image=trafo_site_to_image,
+                integrated_psf_generator=ipsf_gen,
+                proj_shape=proj_shape
+            )
 
-        proj_gen = state_reconstruction.ProjectorGenerator(
-            trafo_site_to_image=trafo_site_to_image,
-            integrated_psf_generator=ipsf_gen,
-            proj_shape=proj_shape
-        )
+            # Pre-calculate projectors (this may take up to a few minutes)
+            proj_gen.setup_cache(print_progress=True)
 
-        # Pre-calculate projectors (this may take up to a few minutes)
-        proj_gen.setup_cache(print_progress=True)
-
-        if self.print_info:
-            if self.psf_supersample > 1:
-                print("Integrated projector(s):")
-                fig, ax = plt.subplots(self.psf_supersample, self.psf_supersample)
-                half_supersample = self.psf_supersample // 2
-                for i in range(self.psf_supersample):
-                    for j in range(self.psf_supersample):
-                        fig.colorbar(ax[i,j].imshow(proj_gen.proj_cache[i,j]), ax = ax[i,j])
-                fig.show()
-            else:
-                plt.imshow(proj_gen.proj_cache[0, 0])
-                plt.title("Integrated projector")
-                plt.colorbar()
+            if self.print_info:
+                if self.psf_supersample > 1:
+                    print("Integrated projector(s):")
+                    fig, ax = plt.subplots(self.psf_supersample, self.psf_supersample)
+                    for i in range(self.psf_supersample):
+                        for j in range(self.psf_supersample):
+                            fig.colorbar(ax[i,j].imshow(proj_gen.proj_cache[i,j]), ax = ax[i,j])
+                    fig.show()
+                else:
+                    plt.imshow(proj_gen.proj_cache[0, 0])
+                    plt.title("Integrated projector")
+                    plt.colorbar()
                 plt.show()
 
-        # Create object in underlying C++ library and set projectors
-        if self.print_info:
-            print("Creating C++ object")
-        self.solver.setProjectors(proj_gen)
+            # Create object in underlying C++ library and set projectors
+            if self.print_info:
+                print("Creating C++ object")
+            self.solver.setProjectors(proj_gen)
 
 
-    def _generate_and_set_projectors_high_spacing(self, proj_shape):
-        ipsf_gen = state_reconstruction.IntegratedPsfGenerator(
-            psf=self.psf, psf_supersample=self.psf_supersample
-        )
+    def _generate_and_set_projectors_no_dependencies(self, proj_shape):
         if proj_shape is None:
-            proj_shape = self.psf.shape
+            proj_shape = self.psf.shape // self.psf_supersample - 2
+        if proj_shape[0] <= 0 or proj_shape[1] <= 0:
+            raise ValueError("Projection shape determined to be zero or negative")
         full_projectors_array = np.ndarray((self.psf_supersample, self.psf_supersample, proj_shape[0], proj_shape[1]))
         for dx in range(self.psf_supersample):
             for dy in range(self.psf_supersample):
-                embedding_size = 4 * np.array(self.psf.shape)
-                image_pos = np.array([np.array([dx, dy]) / self.psf_supersample])
-                # Get local PSFs
-                local_psfs = get_local_psfs(
-                    *image_pos.T, integrated_psf_generator=ipsf_gen
-                )
-                embedded_psfs = get_embedded_local_psfs(
-                    local_psfs, offset=-embedding_size//2,
-                    size=embedding_size, normalize=True
-                )
-                # Get projectors
-                embedded_projs = get_embedded_projectors(embedded_psfs)
-                center_proj = embedded_projs[0]
+                image_pos = np.array([dx, dy]) - self.psf_supersample // 2
 
-                # Crop projectors
-                proj_cropped = crop_projector(center_proj, proj_shape)
-                full_projectors_array[dx,dy] = proj_cropped
+                binned_psf = shift(self.psf, image_pos)
+                binned_psf = binned_psf.reshape(self.psf.shape[0] // self.psf_supersample, self.psf_supersample, \
+                                                self.psf.shape[1] // self.psf_supersample, self.psf_supersample).mean(axis=3).mean(axis=1)
+                
+                binned_psf = binned_psf.reshape((1, -1))
+                binned_psf = np.linalg.pinv(binned_psf)
+                binned_psf = binned_psf.reshape((self.psf.shape[0] // self.psf_supersample, self.psf.shape[1] // self.psf_supersample))
+
+                crop = np.array(binned_psf.shape) - np.array(proj_shape)
+                binned_psf = binned_psf[crop[0] // 2:-((crop[0] + 1) // 2), crop[1] // 2:-((crop[1] + 1) // 2)]
+
+                full_projectors_array[dx,dy] = binned_psf
 
         if self.print_info:
             if self.psf_supersample > 1:
@@ -819,7 +809,7 @@ class ImageAnalysisProjection(ImageAnalysis):
                 plt.imshow(full_projectors_array[0, 0])
                 plt.title("Integrated projector")
                 plt.colorbar()
-                plt.show()
+            plt.show()
         self.solver.setProjectorsFromArray(full_projectors_array)
 
 
@@ -877,10 +867,14 @@ class ImageAnalysisProjection(ImageAnalysis):
                 for row_group in row_groups:
                     for col_group in col_groups:
                         parameter_index = len(parameters)
-                        parameters.append([])
+                        contains_site = False
                         for r in row_group:
                             for c in col_group:
-                                atom_site_index_to_parameter_index[r * self.sites_shape[1] + c] = parameter_index
+                                if r * self.sites_shape[1] + c < len(self.atom_locations):
+                                    atom_site_index_to_parameter_index[r * self.sites_shape[1] + c] = parameter_index
+                                    contains_site = True
+                        if contains_site:
+                            parameters.append([])
         return parameters, atom_site_index_to_parameter_index
 
     
@@ -898,7 +892,7 @@ class ImageAnalysisProjection(ImageAnalysis):
             and hasattr(self, 'spacing') and hasattr(self, 'angle'):
             self._generate_and_set_projectors_low_spacing(proj_shape)
         else:
-            self._generate_and_set_projectors_high_spacing(proj_shape)
+            self._generate_and_set_projectors_no_dependencies(proj_shape)
 
     
     def _calibrate_threshold(self, parameters, atom_site_index_to_parameter_index, histogram_path):
