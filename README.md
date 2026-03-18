@@ -6,10 +6,12 @@ Built upon [David Wei's projection-based state reconstruction](https://github.co
 Still uses this library and its dependencies during calibration.
 
 ## Dependencies
-* [state_reconstruction](https://github.com/david-wei/state_reconstruction) or [state_reconstruction_(performance)](https://github.com/jonaswinklmann/state_reconstruction_performance)
-* [libics](https://www.github.com/david-wei/libics)
 * [Eigen](https://gitlab.com/libeigen/eigen) (via submodule, no installation required)
 * [pybind11](https://github.com/pybind/pybind11) (via submodule, no installation required)
+
+Optionally for low spacing cases:
+* [state_reconstruction](https://github.com/david-wei/state_reconstruction) or [state_reconstruction_(performance)](https://github.com/jonaswinklmann/state_reconstruction_performance)
+* [libics](https://www.github.com/david-wei/libics)
 
 ## Installation
 Currently, only Linux is explicitly supported.
