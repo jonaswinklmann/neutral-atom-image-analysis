@@ -1003,7 +1003,7 @@ class ImageAnalysisProjection(ImageAnalysis):
 
     def calibrate_from_known(self, images, atom_locations : list[tuple[float,float]], psf = None,
                              average_closed_shutter_image = None, proj_shape : tuple[int,int] = None, 
-                             min_cal_samples = None, psf_distance_mult = 2, camera_noise_reduction_method = "image"):
+                             min_cal_samples = None, psf_distance_mult = 2, camera_noise_reduction_method = "image", histogram_path = None):
         """Function to calibrate the image analysis from known list of atom locations
 
         :param images: The images to be used for calibration. Should be iterable with each element being either a DataFrame or convertible to a numpy array
@@ -1023,6 +1023,8 @@ class ImageAnalysisProjection(ImageAnalysis):
         :param camera_noise_reduction_method: Method of reducing camera noise, "border" to use median pixel value of images at the edges, "rowcol" to use median value of images per row and column, \
             "image" to use provided average_closed_shutter_image. If "image" and not average_closed_shutter_image provided, "rowcol" is used, defaults to "image"
         :type camera_noise_reduction_method: string, optional
+        :param histogram_path: Path used to save threshold histograms during calibration. Histograms not saved if None, defaults to None
+        :type histogram_path: string, optional
         :raises AttributeError: Combination of attributes is not meaningful
         :return: List of detection threshold per site, [Empty-peak emission values, Occupied-peak emission values], Fidelity per atom site, 
             Fidelity0 (Fraction of empty sites detected as such) per atom site, Fidelity1 (Fraction of occupied sites detected as such) per atom site, Filling ratio
@@ -1089,7 +1091,7 @@ class ImageAnalysisProjection(ImageAnalysis):
             print("All images reconstructed within " + str((datetime.now() - start_time_reconstruct).total_seconds() * 1e3) + "ms")
 
         first_peak, second_peak, fidelities, fidelities0, fidelities1, filling_ratio = \
-            self._calibrate_threshold(parameters, atom_site_index_to_parameter_index)
+            self._calibrate_threshold(parameters, atom_site_index_to_parameter_index, histogram_path)
         if self.print_info:
             print("F0 avg: " + str(np.average(fidelities0)))
             print("F1 avg: " + str(np.average(fidelities1)))
